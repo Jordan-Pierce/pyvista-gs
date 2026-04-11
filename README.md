@@ -1,61 +1,73 @@
-# Tiny Gaussian Splatting Viewer
-![UI demo](assets/teaser.png)
-This is a simple Gaussian Splatting Viewer built with PyOpenGL / CUDARasterizer. It's easy to install with minimum dependencies. The goal of this project is to provide a minimum example of the viewer for research and study purpose. 
+# Gaussian Splatting Viewer — PyQt5 Edition
 
-# News!
-1/10/2024: The OpenGL renderer has faster sorting backend with `torch.argsort` & `cupy.argsort`. With cuda based sorting, it achieves nearly real-time sorting with OpenGL backend.
+Rewrite of the original GLFW/ImGui viewer as a self-contained **PyQt5 widget**,
+ready to be embedded in any larger Qt application.
 
-12/21/2023: Now we support rendering using the official cuda rasterizer!
+## File map
 
-# Usage
-Install the dependencies:
 ```
-pip install -r requirements.txt
-```
+main_qt.py          ← entry point (replaces main.py)
+gaussian_widget.py  ← QOpenGLWidget — owns the GL context + renderer
+control_panel.py    ← QDockWidget sidebar (replaces ImGui UI)
 
-Launch the viewer:
-```
-python main.py
-```
-
-You can check how to use UI in the "help" panel.
-
-The Gaussian file loader is compatiable with the official implementation. 
-Therefore, download pretrained Gaussian PLY file from [this official link](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip), and select the "point_cloud.ply" you like by clicking the 'open ply' button, and you are all set!
-
-
-# Optional dependencies:
-
-- If you want to use `cuda` backend for rendering, please install the [diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization) following the guidance [here](https://github.com/graphdeco-inria/gaussian-splatting). And also install the following package:
-```
-pip install cuda-python
+util.py             ← unchanged  (Camera math)
+util_gau.py         ← unchanged  (GaussianData, PLY loader)
+renderer_ogl.py     ← unchanged  (OpenGLRenderer)
+renderer_cuda.py    ← unchanged  (CUDARenderer)
+shaders/
+  gau_vert.glsl     ← unchanged
+  gau_frag.glsl     ← unchanged
 ```
 
-- For sorting, we provide three backend: `torch`, `cupy`, and `cpu`. The implementation will choose the first available one based on this priority order: `torch -> cupy -> cpu`. If you have `torch` or `cupy` backend, turning on `auto sort` will achieve nearly real-time sorting.
-    - If you want to use `torch` as sorting backend, install any version of [PyTorch](https://pytorch.org/get-started/locally/).
+## Install
 
-    - If you want to use `cupy` to accelerate sorting, you should install the following package:
-    ```
-    pip install cupy-cuda11x // for cuda 11
-    pip install cupy-cuda12x // for cuda 12
-    ```
+```bash
+pip install PyQt5 PyOpenGL PyOpenGL_accelerate numpy imageio plyfile PyGLM
+# for CUDA renderer:
+# pip install torch  (CUDA build)
+```
 
+## Run
 
-# Troubleshoot
+```bash
+python main_qt.py
+python main_qt.py --hidpi    # 1.5× font scale on HiDPI displays
+```
 
-The rendering speed of is comparable to the official CUDA renderer. If you're experiencing slow rendering, it's likely you are using integrated graphics card instead of a high-performance one. You can configure python to use high-performance graphics card in system settings. In Windows, you can set in Setting > System > Display > Graphics. See the screenshot below for example.
+## Embedding in another application
 
-![Setting > System > Display > Graphics](assets/setting.png)
+`GaussianWidget` is a plain `QOpenGLWidget` subclass — drop it anywhere:
 
-# Limitations
-- The implementation utilizes SSBO, which is only support by OpenGL version >= 4.3. Although this version is widely adopted, MacOS is an exception. As a result, this viewer does not support MacOS.
+```python
+from gaussian_widget import GaussianWidget
+from control_panel   import ControlPanel
 
-- The `cuda` backend currently does not support other visualizations.
+# In your own QMainWindow / QDialog / QSplitter:
+viewer = GaussianWidget()
+panel  = ControlPanel(viewer)
 
-- Based on the flip test between the two backends, the unofficial implementation seems producing slightly different results compared with the official cuda version.
+# Load a scene programmatically:
+viewer.load_ply("/path/to/point_cloud.ply")
+```
 
-# TODO
-- Add orthogonal projection
-- Make the projection matrix compatiable with official cuda implementation
-- Tighter billboard to reduce number of fragments
-- Save viewing parameters
+Signals emitted by `GaussianWidget`:
+- `sig_fps_changed(float)`        — current frames-per-second
+- `sig_gau_count_changed(int)`    — number of loaded Gaussians
+- `sig_status_message(str)`       — human-readable status string
+
+## Key architecture decisions
+
+| Problem | Solution |
+|---|---|
+| GL context timing | All GL construction lives in `initializeGL()`, never `__init__` |
+| GL calls from UI thread | `makeCurrent()` / `doneCurrent()` guards around every out-of-paintGL call |
+| Render loop | `QTimer(interval=16)` → `update()` ≈ 60 fps; `reduce_updates` flag passes through to renderer |
+| CUDA context | `QSurfaceFormat` set to OpenGL 4.3 Core **before** `QApplication` is constructed |
+| Mouse tracking | `camera.first_mouse = True` reset on each `mousePressEvent` to prevent jump |
+| Auto-sort | Second `QTimer(interval=80ms)` calls `sort_and_update` when enabled |
+
+## PyVista / PyVistaQt (future)
+
+Add a second dock with a `QtInteractor` from `pyvistaqt` for VTK-based overlays.
+Keep it in its own `QDockWidget` — never share the OpenGL context with
+the Gaussian renderer.
