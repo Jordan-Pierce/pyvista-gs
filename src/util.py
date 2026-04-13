@@ -3,6 +3,15 @@ import OpenGL.GL.shaders as shaders
 import numpy as np
 import glm
 import ctypes
+from pathlib import Path
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def resource_path(*parts: str) -> Path:
+    return repo_root().joinpath(*parts)
 
 class Camera:
     def __init__(self, h, w):

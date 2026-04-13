@@ -3,11 +3,11 @@ Part of the code (CUDA and OpenGL memory transfer) is derived from https://githu
 '''
 from OpenGL import GL as gl
 import OpenGL.GL.shaders as shaders
-import util
-import util_gau
+from . import util
+from . import util_gau
 import numpy as np
 import torch
-from renderer_ogl import GaussianRenderBase
+from .renderer_ogl import GaussianRenderBase
 from dataclasses import dataclass
 from cuda import cudart as cu
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer

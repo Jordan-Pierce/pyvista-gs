@@ -11,10 +11,11 @@ PyQt5
 PyQt5-Qt5
 PyQt5-sip
 
+# PyVista / VTK scene viewer
+pyvista
+pyvistaqt
+vtk
+
 # Optional — faster Gaussian sorting backends
 # cupy-cuda11x   # or cupy-cuda12x depending on your CUDA version
 # torch          # only needed for CUDA renderer
-
-# Optional — PyVista integration (future use)
-# pyvista
-# pyvistaqt

@@ -8,7 +8,7 @@ ready to be embedded in any larger Qt application.
 ## Install
 
 ```bash
-pip install PyQt5 PyOpenGL PyOpenGL_accelerate numpy imageio plyfile PyGLM
+pip install PyQt5 PyOpenGL PyOpenGL_accelerate numpy imageio plyfile PyGLM pyvista pyvistaqt vtk
 # for CUDA renderer:
 # pip install torch  (CUDA build)
 ```
@@ -18,6 +18,7 @@ pip install PyQt5 PyOpenGL PyOpenGL_accelerate numpy imageio plyfile PyGLM
 ```bash
 python main.py
 python main.py --hidpi    # 1.5× font scale on HiDPI displays
+python unified_viewer.py   # unified PyVista / VTK scene viewer
 ```
 
 ## Embedding in another application
@@ -25,8 +26,8 @@ python main.py --hidpi    # 1.5× font scale on HiDPI displays
 `GaussianWidget` is a plain `QOpenGLWidget` subclass — drop it anywhere:
 
 ```python
-from gaussian_widget import GaussianWidget
-from control_panel   import ControlPanel
+from src.gaussian_widget import GaussianWidget
+from src.control_panel   import ControlPanel
 
 # In your own QMainWindow / QDialog / QSplitter:
 viewer = GaussianWidget()

@@ -14,9 +14,15 @@ All original functionality is preserved:
 """
 from __future__ import annotations
 
-import sys
-import os
 import argparse
+import sys
+from pathlib import Path
+
+
+_ROOT_DIR = Path(__file__).resolve().parent
+_ROOT_DIR_STR = str(_ROOT_DIR)
+if _ROOT_DIR_STR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR_STR)
 
 # ── Must be set BEFORE QApplication ──────────────────────────────────────── #
 from PyQt5.QtGui import QSurfaceFormat
@@ -41,8 +47,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui  import QPalette, QColor, QFont
 
-from gaussian_widget import GaussianWidget
-from control_panel   import ControlPanel
+from src.gaussian_widget import GaussianWidget
+from src.control_panel   import ControlPanel
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -405,12 +411,6 @@ def main():
     parser.add_argument("--hidpi", action="store_true",
                         help="Enable HiDPI font scaling")
     args = parser.parse_args()
-
-    # Add repo root to path so util / util_gau / renderer_* are importable
-    here = os.path.dirname(os.path.abspath(__file__))
-    if here not in sys.path:
-        sys.path.insert(0, here)
-    os.chdir(here)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

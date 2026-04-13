@@ -1,6 +1,6 @@
 from OpenGL import GL as gl
-import util
-import util_gau
+from . import util
+from . import util_gau
 import numpy as np
 
 try:
@@ -122,7 +122,10 @@ class OpenGLRenderer(GaussianRenderBase):
     def __init__(self, w, h):
         super().__init__()
         gl.glViewport(0, 0, w, h)
-        self.program = util.load_shaders('shaders/gau_vert.glsl', 'shaders/gau_frag.glsl')
+        self.program = util.load_shaders(
+            util.resource_path("shaders", "gau_vert.glsl"),
+            util.resource_path("shaders", "gau_frag.glsl"),
+        )
 
         # Vertex data for a quad
         self.quad_v = np.array([
