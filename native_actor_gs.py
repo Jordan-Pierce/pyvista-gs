@@ -30,6 +30,15 @@ def load_3dgs_as_polydata(ply_path):
     # 5. Extract Base Color (SH DC Component)
     sh_dc = np.stack([vertex['f_dc_0'], vertex['f_dc_1'], vertex['f_dc_2']], axis=-1)
     mesh.point_data['gs_sh_dc'] = sh_dc.astype(np.float32)
+
+    # 6. Extract Degree 1 Spherical Harmonics (View-Dependent Lighting)
+    sh1_y = np.stack([vertex['f_rest_0'], vertex['f_rest_1'], vertex['f_rest_2']], axis=-1)
+    sh1_z = np.stack([vertex['f_rest_3'], vertex['f_rest_4'], vertex['f_rest_5']], axis=-1)
+    sh1_x = np.stack([vertex['f_rest_6'], vertex['f_rest_7'], vertex['f_rest_8']], axis=-1)
+
+    mesh.point_data['gs_sh1_y'] = sh1_y.astype(np.float32)
+    mesh.point_data['gs_sh1_z'] = sh1_z.astype(np.float32)
+    mesh.point_data['gs_sh1_x'] = sh1_x.astype(np.float32)
     
     # Center the mesh (Optional, but recommended for viewing)
     centroid = np.mean(mesh.points, axis=0)
@@ -48,6 +57,9 @@ def apply_3dgs_shaders(actor, mesh):
     mapper.MapDataArrayToVertexAttribute("gs_quats", "gs_quats", vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1)
     mapper.MapDataArrayToVertexAttribute("gs_opacity", "gs_opacity", vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1)
     mapper.MapDataArrayToVertexAttribute("gs_sh_dc", "gs_sh_dc", vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1)
+    mapper.MapDataArrayToVertexAttribute("gs_sh1_y", "gs_sh1_y", vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1)
+    mapper.MapDataArrayToVertexAttribute("gs_sh1_z", "gs_sh1_z", vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1)
+    mapper.MapDataArrayToVertexAttribute("gs_sh1_x", "gs_sh1_x", vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1)
     
     if hasattr(mapper, 'SetUseProgramPointSize'):
         mapper.SetUseProgramPointSize(True)
@@ -68,6 +80,9 @@ def apply_3dgs_shaders(actor, mesh):
         in vec4 gs_quats;
         in float gs_opacity;
         in vec3 gs_sh_dc;
+        in vec3 gs_sh1_y;
+        in vec3 gs_sh1_z;
+        in vec3 gs_sh1_x;
         
         out vec3 v_conic;
         out vec3 v_color;
@@ -137,8 +152,19 @@ def apply_3dgs_shaders(actor, mesh):
         gl_PointSize = clamp(max_radius * 2.0, 2.0, 1024.0);
         v_pointSize = gl_PointSize; // Pass to fragment shader
         
-        // Pass Base Color and Opacity
-        v_color = (gs_sh_dc * 0.28209479) + 0.5;
+        // Evaluate Degree 1 Spherical Harmonics for view-dependent lighting
+        vec3 camPosMC = (inverse(MCVCMatrix) * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+        vec3 dir = normalize(vertexMC.xyz - camPosMC);
+
+        float SH_C0 = 0.28209479;
+        float SH_C1 = 0.48860251;
+
+        vec3 color = gs_sh_dc * SH_C0;
+        color = color - (SH_C1 * dir.y * gs_sh1_y)
+                      + (SH_C1 * dir.z * gs_sh1_z)
+                      - (SH_C1 * dir.x * gs_sh1_x);
+
+        v_color = clamp(color + 0.5, 0.0, 1.0);
         v_opacity = gs_opacity;
         """, False
     )
@@ -182,9 +208,28 @@ def apply_3dgs_shaders(actor, mesh):
     )
 
 
+def sort_splats_by_depth(plotter, mesh):
+    """Sorts the VTK points back-to-front based on the camera view vector."""
+    cam = plotter.camera
+
+    cam_pos = np.array(cam.position)
+    focal_pt = np.array(cam.focal_point)
+    view_dir = focal_pt - cam_pos
+
+    depths = np.dot(mesh.points, view_dir)
+    sorted_indices = np.argsort(depths)[::-1]
+
+    n_points = len(sorted_indices)
+    verts = np.empty((n_points, 2), dtype=np.int64)
+    verts[:, 0] = 1
+    verts[:, 1] = sorted_indices
+
+    mesh.verts = verts.ravel()
+
+
 def main():
     # Load data
-    asset_path = "coral_reef.ply" # Update this path to your PLY file
+    asset_path = "splat.ply" # Update this path to your PLY file
     splat_mesh = load_3dgs_as_polydata(asset_path) # Update path!
     
     plotter = pv.Plotter()
@@ -208,6 +253,13 @@ def main():
     # 3. Add a standard PyVista object to prove they exist in the same space
     box = pv.Box(bounds=splat_mesh.bounds)
     plotter.add_mesh(box, color="cyan", style="wireframe", line_width=2)
+
+    def on_camera_stop_move(caller, event):
+        sort_splats_by_depth(plotter, splat_mesh)
+        plotter.render()
+
+    plotter.iren.add_observer("EndInteractionEvent", on_camera_stop_move)
+    sort_splats_by_depth(plotter, splat_mesh)
     
     plotter.show()
 

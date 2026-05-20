@@ -144,7 +144,7 @@ def apply_3dgs_shaders(actor, mesh):
 
 def main():
     # Load data
-    asset_path = "coral_reef.ply" # Update this path to your PLY file
+    asset_path = "splat.ply" # Update this path to your PLY file
     splat_mesh = load_3dgs_as_polydata(asset_path) # Update path!
     
     plotter = pv.Plotter()
