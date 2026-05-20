@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QWidget, QScrollArea, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QComboBox, QCheckBox,
     QFileDialog, QFrame, QGroupBox, QSizePolicy,
+    QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSlot
 from PyQt5.QtGui  import QFont
@@ -151,7 +152,7 @@ class ControlPanel(QWidget):
         self._load_start_t: float | None = None
 
         self.setObjectName("controlPanel")
-        self.setFixedWidth(320)
+        self.setFixedWidth(400)
 
         # ── Scroll area wraps all content ─────────────────────────────── #
         outer = QVBoxLayout(self)
@@ -213,6 +214,25 @@ class ControlPanel(QWidget):
         )
         self._fov_slider.on_change(self._gw.set_fovy_deg)
 
+        focal_row = QHBoxLayout()
+        focal_lbl = QLabel("Focal Pt (X,Y,Z)")
+        focal_lbl.setObjectName("sliderLabel")
+        focal_row.addWidget(focal_lbl)
+
+        self._focal_spinners: list[QDoubleSpinBox] = []
+        current_focal = self._gw.focal_point()
+        for i in range(3):
+            spin = QDoubleSpinBox()
+            spin.setRange(-1000.0, 1000.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.1)
+            spin.setValue(float(current_focal[i]))
+            spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+            spin.setStyleSheet("background: #1e2130; border: 1px solid #2e3348; color: #c8d0ea; padding: 2px;")
+            spin.valueChanged.connect(self._on_focal_changed)
+            self._focal_spinners.append(spin)
+            focal_row.addWidget(spin)
+
         cam_btns = QHBoxLayout()
         self._fit_btn   = QPushButton("⌖  Fit to Scene")
         self._reset_btn = QPushButton("⟳  Reset Camera")
@@ -226,6 +246,7 @@ class ControlPanel(QWidget):
         cam_btns.addWidget(self._reset_btn)
 
         cam.layout().addWidget(self._fov_slider)
+        cam.layout().addLayout(focal_row)
         cam.layout().addLayout(cam_btns)
         cam.layout().addWidget(self._flip_btn)
         root.addWidget(cam)
@@ -306,11 +327,13 @@ class ControlPanel(QWidget):
         self._gw.sig_gau_count_changed.connect(self._on_count)
         self._gw.sig_status_message.connect(self._on_status)
         self._gw.sig_loading_changed.connect(self._on_loading)
+        self._gw.sig_focal_changed.connect(self._on_focal_updated_from_view)
 
         # Collect all interactive controls (disabled during load)
         self._interactive: list[QWidget] = [
             self._open_btn, self._backend_combo,
             self._fov_slider, self._scale_slider, self._shading_combo,
+            *self._focal_spinners,
             self._fit_btn, self._reset_btn, self._flip_btn,
             self._sort_btn, self._auto_sort_chk, self._save_btn,
         ]
@@ -352,6 +375,20 @@ class ControlPanel(QWidget):
         if self._load_start_t is not None:
             elapsed = time.perf_counter() - self._load_start_t
             self._status_lbl.setText(f"Loading… {elapsed:.1f}s")
+
+    @pyqtSlot(float, float, float)
+    def _on_focal_updated_from_view(self, x: float, y: float, z: float):
+        coords = [x, y, z]
+        for i, spin in enumerate(self._focal_spinners):
+            spin.blockSignals(True)
+            spin.setValue(coords[i])
+            spin.blockSignals(False)
+
+    def _on_focal_changed(self, *_args):
+        x = self._focal_spinners[0].value()
+        y = self._focal_spinners[1].value()
+        z = self._focal_spinners[2].value()
+        self._gw.set_focal_point(x, y, z)
 
     def _on_open_ply(self):
         path, _ = QFileDialog.getOpenFileName(
