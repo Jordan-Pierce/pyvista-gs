@@ -15,6 +15,6 @@ PyQt5-sip
 # cupy-cuda11x   # or cupy-cuda12x depending on your CUDA version
 # torch          # only needed for CUDA renderer
 
-# Optional — PyVista integration (future use)
-# pyvista
-# pyvistaqt
+# PyVista integration (required by main_gs_qt.py / gs_widget.py)
+pyvista
+pyvistaqt
