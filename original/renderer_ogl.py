@@ -1,6 +1,6 @@
 from OpenGL import GL as gl
-import util
-import util_gau
+import util as util
+import util_gau as util_gau
 import numpy as np
 
 try:

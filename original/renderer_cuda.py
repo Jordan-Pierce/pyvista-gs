@@ -3,8 +3,8 @@ Part of the code (CUDA and OpenGL memory transfer) is derived from https://githu
 '''
 from OpenGL import GL as gl
 import OpenGL.GL.shaders as shaders
-import util
-import util_gau
+import original.util as util
+import original.util_gau as util_gau
 import numpy as np
 import torch
 from renderer_ogl import GaussianRenderBase

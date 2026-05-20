@@ -22,8 +22,8 @@ from PyQt5.QtGui     import QPainter, QColor, QFont, QPen
 
 import OpenGL.GL as gl
 
-import util
-import util_gau
+import util as util
+import util_gau as util_gau
 from renderer_ogl import OpenGLRenderer, GaussianRenderBase
 
 
