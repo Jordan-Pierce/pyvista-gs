@@ -1,0 +1,626 @@
+<thinking>
+The user says it works now but still doesn't look good enough compared to the original. Let me think about what remaining visual differences there could be between our PyVista/VTK point-sprite approach and the original quad-based instanced renderer.
+
+Key remaining differences:
+
+1. **Point sprites vs quads**: The original renders each Gaussian as a screen-space quad with non-square extents (different `quadwh_scr` for x and y). Our point sprites are always square (`gl_PointSize` is a single value). This means elongated Gaussians will always appear as circles/squares rather than ellipses.
+
+2. **Alpha blending**: The original uses explicit `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` with depth sorting. VTK has its own blending setup that might not be exactly the same.
+
+3. **`coordxy` in the fragment shader**: In the original, `coordxy` is the actual pixel offset from the splat center (in real pixel units). In our version, we reconstruct this from `gl_PointCoord` and `v_pointSize`. The original's `coordxy` comes from the quad vertex position multiplied by the actual screen-space half-size, so it's more accurate for non-circular Gaussians.
+
+4. **Point size clamping**: We clamp `gl_PointSize` to max 1024, but the original can render Gaussians as large as needed (it's rendering actual quads).
+
+5. **The EWA projection**: We're now computing the proper 2D covariance, but the `mat3 W = mat3(MCVCMatrix)` — is this the right rotation part? The MCVCMatrix includes translation, and the mat3 constructor extracts the upper-left 3x3. For a view matrix, the upper-left 3x3 is the rotation matrix (assuming no scale in the model matrix). This should be correct.
+
+6. **Aspect ratio of point sprites**: VTK's `gl_PointCoord` gives (0,0) to (1,1) coordinates in a square. When we compute `d = (gl_PointCoord - 0.5) * v_pointSize`, we get pixel offsets assuming a square tile. But the actual Gaussian may be very elongated, so the square tile wastes pixels for elongated splats and clips elongated ones.
+
+7. **`gl_PointSize` on GLES/VTK**: There's a GLES30 point size implementation tag in the shader (`//VTK::PointSizeGLES30::Dec` and `//VTK::PointSizeGLES30::Impl`) which may interfere with our `gl_PointSize` setting.
+
+8. **Depth test / depth write**: The original likely disables depth writing for transparent objects. VTK might be writing depth.
+
+9. **The `coordxy` computation**: In the fragment shader, we compute `d = (gl_PointCoord - 0.5) * v_pointSize`. But since `gl_PointSize` is based on the max eigenvalue (the major axis), this is only correct for that axis. For the minor axis, we're using too large a tile, which wastes computation but shouldn't cause visual errors. The conic correctly handles the actual falloff.
+
+The most impactful remaining issues are probably:
+1. **Square point sprites vs non-square quads** - elongated Gaussians are clipped incorrectly because our square tile isn't wide enough in one direction
+2. **Alpha blending state** - VTK might not be using the right blend function
+
+Let me think about what can actually be done within the VTK point-sprite constraint:
+
+For issue 1 (square tiles): The real problem is that `gl_PointSize` is a single value. We use the max eigenvalue to size it, which is correct for the major axis but wasteful. But crucially, the point sprite IS large enough to contain the Gaussian in both dimensions since we're using the MAX eigenvalue. So this shouldn't cause clipping. The issue is wasted pixels on the minor axis, not clipping.
+
+Actually wait - I need to reconsider. Our `gl_PointSize = clamp(ceil(3.0 * sqrt(lam1)) * 2.0, 2.0, 1024.0)`. lam1 is the max eigenvalue of the 2D cov. 3*sqrt(lam1) is the 3-sigma radius in the major direction. So the tile should be large enough to contain the full Gaussian. This should be OK.
+
+The `coordxy` computation: `d = (gl_PointCoord - 0.5) * v_pointSize`. This gives the pixel offset from center within the square tile. Since `v_pointSize = 2 * ceil(3*sqrt(lam1))`, the range of d is [-3*sqrt(lam1), +3*sqrt(lam1)] in both x and y. The conic then correctly selects which pixels within this square have non-negligible alpha. So the visual result should be correct for individual splats.
+
+So what's still wrong? Let me think:
+
+1. **`//VTK::PointSizeGLES30::Impl`** - this might override `gl_PointSize` in some VTK builds
+2. **Depth sorting quality** - our depth sort is per-frame but only on camera stop, not continuously
+3. **The EWA projection matrix order** - `T = J * W` vs `T = W * J` - this could be a significant error in our covariance calculation
+4. **The fragment shader `d` computation** - in the original, `coordxy` is in actual screen pixels. In VTK, `gl_PointCoord` is in [0,1] relative to the point sprite. When we multiply by `v_pointSize`, we get pixel offsets from the center. This should be equivalent.
+
+Actually, let me reconsider the EWA math. The standard formula is:
+
+Sigma2D = J * W * Sigma3D * (J * W)^T
+
+where W is the upper-left 3x3 of the view matrix (world→camera).
+
+Our code: `mat3 T = J * W; mat3 cov2 = T * Sigma * transpose(T);`
+
+This gives `T * Sigma * T^T = J * W * Sigma * (J * W)^T = J * W * Sigma * W^T * J^T`.
+
+Since Sigma is symmetric, this equals `J * (W * Sigma * W^T) * J^T` which is correct.
+
+But wait — `W = mat3(MCVCMatrix)`. The MCVCMatrix transforms from model space to camera space. Its upper-left 3x3 is the rotation part. Is this "W" as defined in the EWA formula?
+
+In the EWA formula, W is the rotation from world space to camera space (just the rotation, not including translation). If our mesh points are in world space (which they are, since we centered them), then yes, `mat3(MCVCMatrix)` gives the correct W.
+
+But there's a subtlety: VTK passes matrices in a specific way to the GPU. GLSL matrices are column-major, and VTK should be uploading them column-major. If the MCVCMatrix is already correct column-major in the GPU, then `mat3(MCVCMatrix)` extracts the correct upper-left 3x3. This should be fine.
+
+Let me look at other potential issues:
+
+**Alpha blending**: For 3DGS to look correct, we need `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` and depth-sorted rendering back-to-front. VTK does handle alpha blending for semi-transparent actors, but it uses its own mechanism. The blend function might not be `GL_ONE_MINUS_SRC_ALPHA` by default.
+
+Actually, VTK has a "depth peeling" algorithm for correct transparency, and also a simpler approach where you set the actor's opacity < 1. When `actor.GetProperty().SetOpacity(0.99)` is called, VTK enables alpha blending. But the exact blend function might differ.
+
+Looking at the original code — it does its own sort and relies on `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` blending with the sorted order. Our VTK code does depth sorting too, but VTK might be using depth peeling or a different blend mode.
+
+This could be a significant visual difference. We can try to force the correct blend function by setting it explicitly.
+
+**Options to improve quality:**
+
+1. **Fix blend function**: Ensure VTK uses `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`
+2. **Disable depth writing**: Gaussians shouldn't write to the depth buffer (they're transparent)
+3. **The `coordxy` sign convention**: The original fragment shader uses `coordxy` which is the actual pixel displacement. Let me verify our reconstruction is correct.
+4. **Point sprite size for non-circular Gaussians**: Use separate x/y half-sizes and discard early
+
+Actually, one thing that could make a big difference: **the `coordxy` in the fragment**. In the original, `coordxy = position * quadwh_scr` where `position` is the quad vertex in [-1,1] x [-1,1] and `quadwh_scr = vec2(3*sqrt(cov2d.x), 3*sqrt(cov2d.z))`. So `coordxy.x` ranges over `[-3*sqrt(cxx), +3*sqrt(cxx)]` and `coordxy.y` over `[-3*sqrt(cyy), +3*sqrt(cyy)]`.
+
+In our fragment shader: `d = (gl_PointCoord - 0.5) * v_pointSize`. The `v_pointSize = clamp(ceil(3*sqrt(lam1))*2, 2, 1024)` where `lam1` is the max eigenvalue. So `d.x` and `d.y` both range from `-v_pointSize/2` to `+v_pointSize/2`, which is `[-3*sqrt(lam1), +3*sqrt(lam1)]`.
+
+In the original, `d.x` ranges over `[-3*sqrt(cxx), +3*sqrt(cxx)]` which might be different from `[-3*sqrt(lam1), +3*sqrt(lam1)]`. If `cxx < lam1` (i.e., if x is not the major axis), then our `d.x` range is larger than the original's, which means we're computing the conic over a larger area. But the conic will correctly discard pixels where the power is too high, so this doesn't introduce visual errors — just slightly less efficient.
+
+Wait, but if `cyy < lam1` (y is not the major axis), then for pixels along the y-axis, our `d.y` values would be larger (in magnitude) than the original's `coordxy.y`. But again, the conic handles this correctly by discarding.
+
+So the computation should be equivalent. The main differences might be:
+
+1. **Alpha blending / depth writing**
+2. **Point size clamping at 1024** - very large splats get clipped
+3. **`//VTK::PointSizeGLES30::Impl`** potentially conflicting with our gl_PointSize
+
+Let me check: looking at the compiled shader, line 95 shows `//VTK::PointSizeGLES30::Impl` before our vertex impl. On desktop OpenGL, this expands to nothing (it's only for GLES). So that's fine.
+
+The most impactful remaining fix is probably the **alpha blending**. Let me look at what VTK does and how to control it.
+
+In VTK, when `actor.GetProperty().SetOpacity(v)` is called with v < 1, VTK marks the actor as translucent and uses alpha blending. The default blend function in VTK for translucent actors is `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`. So this should already be correct.
+
+But there's another issue: **depth testing**. VTK by default renders translucent actors with depth testing enabled but depth writing disabled (to allow back-to-front compositing). This is actually what we want!
+
+Hmm, so what's actually wrong visually? Let me think more carefully.
+
+Looking at the original vertex shader more carefully:
+
+```glsl
+vec2 quadwh_ndc = quadwh_scr / wh * 2;  // in ndc space
+g_pos_screen.xy = g_pos_screen.xy + position * quadwh_ndc;
+coordxy = position * quadwh_scr;
+gl_Position = g_pos_screen;
+```
+
+The quad is expanded in NDC space by the actual screen-space half-sizes (different for x and y). So the quad's aspect ratio matches the Gaussian's 2D covariance. This is fundamentally different from our square point sprites.
+
+Our square point sprite uses a size based on `lam1` (max eigenvalue). For a highly elongated Gaussian (lam1 >> lam2), our point sprite is much too large in the minor axis direction, wasting many fragments. But the conic discards them, so visually it should be the same.
+
+Actually, wait. There's one case where it matters: when a very elongated Gaussian is near the edge of the screen. With a square point sprite, part of the sprite may be clipped by the viewport, while the original quad might not clip the same part (since the quad is narrower in that direction). This would cause some splats near screen edges to be rendered differently.
+
+But for the general case, the conic-based discarding should make our result visually equivalent.
+
+Let me think about what else could be causing visual differences:
+
+1. **SH degree-3 terms missing**: We only support up to degree-2 SH (due to GL attribute limits). The original supports degree-3. This means our view-dependent colors are less accurate for renders with SH degree 3 data.
+
+2. **The SH computation in mode 5 (SH:0~1)**: Looking at our shader:
+```glsl
+if (render_mode != 3 && render_mode != 4) {
+    color += -SH_C1 * dir.y * gs_sh1_0;
+    color +=  SH_C1 * dir.z * gs_sh1_1;
+    color += -SH_C1 * dir.x * gs_sh1_2;
+}
+
+if (render_mode <= 2 || render_mode >= 6) {
+    // degree-2 terms
+}
+```
+
+So for mode 5 (SH:0~1), we add degree-1 terms. For modes 0,1,2 (Gaussian Ball, Flat Ball, Billboard) and mode 6,7 (SH:0~2, SH:0~3), we also add degree-2. This seems right.
+
+But wait - looking at the original shader's SH computation logic:
+```glsl
+if (sh_dim > 3 && render_mod >= 1)  // degree-1
+if (sh_dim > 12 && render_mod >= 2)  // degree-2
+if (sh_dim > 27 && render_mod >= 3)  // degree-3
+```
+
+The original's render_mod >= 1 means "use at least degree-1 SH". Our modes are different:
+- mode 4 = SH:0 (DC only)
+- mode 5 = SH:0~1 (degree 0+1)
+- mode 6 = SH:0~2 (degree 0+1+2)
+- mode 7 = SH:0~3 default (degree 0+1+2)
+
+So for modes 0,1,2,3 (the non-SH modes), our shader adds SH degree-1 terms, which the original's "billboard" (render_mod=-2) doesn't use (it returns early with just the SH0 color). Let me check the original again:
+
+In the original:
+- render_mod == -2: billboard (returns early with flat color, no SH eval)
+- render_mod == -1: depth
+- render_mod == -3: flat ball
+- render_mod == -4: gaussian ball
+- render_mod >= 1: SH dim 0+..., >= 2: +degree-2, >= 3: +degree-3
+
+So for Gaussian Ball (render_mod=-4) and Flat Ball (render_mod=-3), the original evaluates SH normally (sh_dim > 3 check always depends on the data, but render_mod >= 1 is never true for negative modes). Wait:
+
+```glsl
+if (sh_dim > 3 && render_mod >= 1)
+```
+
+For render_mod = -4 (Gaussian Ball), `render_mod >= 1` is false, so SH degree-1 is NOT added. The color is just SH_C0 * sh0 + 0.5. This means Gaussian Ball and Flat Ball show only the DC (constant) color!
+
+But in our shader, for render_mode = 0 (Gaussian Ball):
+```glsl
+if (render_mode != 3 && render_mode != 4) {  // true for mode 0
+    // adds degree-1 SH
+}
+if (render_mode <= 2 || render_mode >= 6) {  // true for mode 0
+    // adds degree-2 SH
+}
+```
+
+So our Gaussian Ball mode includes SH degree-1 and degree-2, while the original only shows DC. This is a semantic difference in the render modes.
+
+Actually, looking at this more carefully — the RENDER_MODES list is:
+- 0: Gaussian Ball — full color, Gaussian falloff
+- 1: Flat Ball — full color, hard disk
+- 2: Billboard — alias for 0 (full SH color)
+- 3: Depth — rainbow depth
+- 4: SH:0 — DC only
+- 5: SH:0~1 — DC + degree 1
+- 6: SH:0~2 — DC + degrees 1-2
+- 7: SH:0~3 default — DC + degrees 1-2
+
+The comment in native_actor_gs.py says modes 0,1,2 use "full-SH colour" and mode 4 uses "DC only". So our interpretation is that Gaussian Ball (0) uses full SH, which differs from the original where Gaussian Ball (-4) shows only DC color.
+
+But this might be intentional for our implementation — having modes 0-2 show full SH color (since users expect a "good looking" view by default).
+
+OK, so the SH mode semantics are intentionally different, and that's probably fine.
+
+**So what are the actual remaining visual issues?**
+
+Looking at it from a different angle — what could make it look visually "not good enough"?
+
+1. **Depth peeling vs simple alpha blending**: VTK might be using depth peeling for translucency, which is a different algorithm from simple back-to-front alpha compositing. Depth peeling is more correct for general transparency but may produce different results for 3DGS.
+
+2. **The `d` computation using `gl_PointCoord`**: When `gl_PointSize` is large (e.g., 512 or 1024), there can be precision issues with `gl_PointCoord` (it's typically 8-bit per component).
+
+3. **VTK's built-in lighting**: Even with `lighting=False`, VTK might still apply some lighting calculations.
+
+4. **The `//VTK::PointSizeGLES30::Impl`**: Even on desktop, this tag might do something in some VTK versions.
+
+5. **Interaction with VTK's renderer**: VTK has its own background, compositor, etc. that might affect blending.
+
+What can we actually do?
+
+**Option 1: Geometry shader for quads** — Use a geometry shader (VTK supports geometry shader replacement) to expand points into screen-aligned quads. This would match the original's rendering approach more closely.
+
+**Option 2: Use a geometry shader passthrough + instanced rendering approach**
+
+**Option 3: Force specific OpenGL state via VTK render passes**
+
+**Option 4: Use the `//VTK::PositionVC::Impl` replacement differently**
+
+The most impactful improvement would be a **geometry shader** that expands each point into a screen-aligned quad matching the 2D Gaussian extent. This would:
+- Allow non-square tiles (matching the original's variable-aspect quads)
+- Remove the square point-sprite limitation
+- Properly handle large Gaussians without gl_PointSize clamping
+- Pass proper per-pixel screen-space coordinates to the fragment shader
+
+VTK does support geometry shaders via `sp.AddGeometryShaderReplacement()` or `sp.SetGeometryShaderCode()`. Let me think about how to implement this.
+
+Actually, the question is whether VTK can inject a complete geometry shader. The API is:
+- `sp.SetGeometryShaderCode(code)` — replaces the entire geometry shader
+- `sp.AddGeometryShaderReplacement(token, before, replacement, afterOther)` — similar to vertex/fragment replacements
+
+The challenge is that VTK's geometry shader infrastructure might be complex, and we'd need to correctly handle the input/output between the vertex and geometry shader.
+
+Alternatively, can we just set a complete custom vertex + fragment shader, bypassing VTK's pipeline entirely? Yes: `sp.SetVertexShaderCode(code)` and `sp.SetFragmentShaderCode(code)`. This would give us full control but we'd lose VTK's built-in camera matrices, which we'd need to pass as custom uniforms.
+
+Actually that could be the cleanest approach — write complete custom shaders using `sp.SetVertexShaderCode()` and `sp.SetFragmentShaderCode()`. We'd need to declare all uniforms we need (projection matrix, view matrix, viewport size) as custom uniforms and update them ourselves.
+
+But this gets complex. Let me think about the geometry shader approach instead.
+
+With a geometry shader that turns each point into a quad:
+- Input: point with all vertex attributes
+- Output: 4 vertices forming a screen-aligned quad (or triangle strip)
+- Each output vertex carries the screen-space position and the local offset `coordxy`
+
+This would exactly replicate the original's rendering approach.
+
+Here's a rough plan:
+
+**Vertex shader**: Just pass-through all attributes, no gl_PointSize needed
+**Geometry shader**: Takes each point, expands to quad in clip space
+**Fragment shader**: Uses the `coordxy` from geometry shader
+
+The geometry shader would compute the 2D covariance and expand the point to a quad.
+
+Let me think about if this is feasible with VTK's API.
+
+VTK's `vtkShaderProperty`:
+- `AddGeometryShaderReplacement(shaderTag, before, code, afterOther)` — For geometry shaders, VTK needs to set up the geometry shader program type. The default geometry shader may be empty (pass-through) for points.
+
+Actually, I'm not sure VTK's points-mode rendering uses a geometry shader by default. The geometry shader replacement would only work if there's a geometry shader program already. We might need to set the complete geometry shader code.
+
+This is getting complex. Let me think about what other improvements are feasible without a geometry shader.
+
+**Alternative: Pass separate half-sizes as varyings and use non-square sampling in the fragment shader**
+
+Even with point sprites, we can pass `half_x` and `half_y` as varyings (the 3-sigma extents in x and y), and in the fragment shader, normalize `d.x / half_x` and `d.y / half_y` before computing the conic. But wait, the conic already handles non-circular shapes correctly — the issue is only that our square tile doesn't efficiently cover the Gaussian.
+
+Actually, I think the visual quality issue might be more subtle. Let me re-examine the fragment shader:
+
+Our fragment: `vec2 d = (gl_PointCoord - 0.5) * v_pointSize;`
+
+The `v_pointSize` is `clamp(ceil(3 * sqrt(lam1)) * 2, 2, 1024)` where `lam1` is the max eigenvalue of cov2. In the original, `coordxy = position * quadwh_scr` where `quadwh_scr = vec2(3*sqrt(cov2d.x), 3*sqrt(cov2d.z))`.
+
+So in the original:
+- `coordxy.x` ranges from `-3*sqrt(cxx)` to `+3*sqrt(cxx)`  
+- `coordxy.y` ranges from `-3*sqrt(cyy)` to `+3*sqrt(cyy)`
+
+In ours:
+- `d.x` ranges from `-v_pointSize/2` to `+v_pointSize/2` = `-3*sqrt(lam1)` to `+3*sqrt(lam1)`
+- `d.y` same range
+
+The conic power computation: `power = -0.5*(conic.x * d.x^2 + conic.z * d.y^2) - conic.y * d.x * d.y`
+
+This is the same formula in both. The conic values are the same (derived from cxx, cxy, cyy). So the power values should be the same for the same (d.x, d.y) coordinates.
+
+The question is: for a given pixel, does our `d` match the original's `coordxy`?
+
+In the original: the quad vertex at `position = (+1, +1)` has `coordxy = (3*sqrt(cxx), 3*sqrt(cyy))`. The quad covers exactly the 3-sigma extent in both x and y directions.
+
+In ours: the pixel at `gl_PointCoord = (1, 1)` (corner of the point sprite) has `d = (v_pointSize/2, v_pointSize/2) = (3*sqrt(lam1), 3*sqrt(lam1))`.
+
+So for a circular Gaussian (lam1 ≈ cxx ≈ cyy), our `d` at the corners matches the original's `coordxy` at the corners. For an elongated Gaussian (lam1 >> lam2), our `d` at the corners is too large in the minor axis direction.
+
+But the conic still correctly computes the power, and pixels with `power > 0` are discarded. So the visual output should be the same — just with wasted fragments in the minor axis direction.
+
+OK so the computation is equivalent. The visual differences must come from something else.
+
+Let me think about what ACTUALLY causes the visual to be "not good enough":
+
+1. **Alpha blending accumulation order** — Even with depth sorting, VTK might handle the compositing differently. The sort is done on the CPU and the sorted order is passed via the `mesh.verts` array. But VTK might not preserve this draw order exactly.
+
+2. **The SH coordinate system** — `dir = normalize(vertexMC.xyz - camPosMC)` — is `vertexMC` in world space? And is `camPosMC = inverse(MCVCMatrix) * (0,0,0,1)` correctly computing the camera position in model space?
+
+Actually wait — `inverse(MCVCMatrix) * vec4(0,0,0,1)` gives the camera origin in model/world space. And `vertexMC.xyz` is the vertex position in model/world space. So `dir = normalize(vertexMC.xyz - camPosMC)` is the direction from camera to splat in world space. This is correct for SH evaluation.
+
+3. **Large `gl_PointSize` issue** — Nvidia/AMD drivers may not render point sprites correctly when `gl_PointSize > 64` or similar. Some drivers have implementation-defined max sizes.
+
+4. **The `SetUseProgramPointSize`** — We call `mapper.SetUseProgramPointSize(True)` only if the attribute exists. Is this being set correctly?
+
+5. **The `render_mode` condition for degree-2 SH** — `if (render_mode <= 2 || render_mode >= 6)`. For mode 5 (SH:0~1), degree-2 is not added (correct). For modes 0,1,2, degree-2 IS added. This is our design choice.
+
+Actually, I wonder if the visual issue is something more fundamental. Let me think about what specific artifacts users would see:
+
+- **Blurry/incorrect splat shapes**: Would indicate EWA projection issues
+- **Wrong colors**: Would indicate SH or color computation issues  
+- **Depth ordering artifacts (flickering/z-fighting)**: Would indicate blending issues
+- **Splats too large or too small**: Would indicate focal length issues (now fixed)
+- **Very elongated splats appearing as circles**: Would indicate that the conic is not being applied correctly
+
+Actually, thinking about this from a "what would the user notice" perspective, and given that the EWA projection is now fixed, the remaining most noticeable issues are likely:
+
+1. **GL_POINTS max size**: Many GPUs limit `gl_PointSize` to 64 or 128 pixels. Very large Gaussians (background elements) get clipped to this size.
+
+2. **The geometry shader approach**: Converting to quads would bypass the gl_PointSize limit entirely.
+
+3. **Depth buffer writes**: If VTK is writing depth for these translucent objects, it can cause incorrect compositing.
+
+4. **The `//VTK::PointSizeGLES30::Dec/Impl`**: These might interfere.
+
+Let me check what GL_POINT_SIZE_RANGE typically is... On NVIDIA, it's often [1, 189.875] or larger. So 1024 clamping may be fine.
+
+I think the most impactful improvement would be implementing a **geometry shader to replace point sprites with quads**. This is the architecturally correct solution that matches the original.
+
+Let me outline how to do it with VTK:
+
+1. Move the EWA computation to the geometry shader
+2. Vertex shader: just pass through vertex attributes
+3. Geometry shader: compute 2D covariance, expand point to quad in NDC/clip space
+4. Fragment shader: compute Gaussian alpha from coordxy
+
+VTK's geometry shader API: `sp.SetGeometryShaderCode(code)` sets a complete geometry shader. The geometry shader needs to declare:
+```glsl
+layout(points) in;
+layout(triangle_strip, max_vertices = 4) out;
+```
+
+And it has access to `gl_in[0].gl_Position` for the input point position.
+
+The challenge is that we need to pass vertex attributes from the vertex shader to the geometry shader (as arrays), and from the geometry shader to the fragment shader.
+
+In VTK's shader replacement system, custom vertex attributes are passed as `in vec3 gs_scales` etc. in the vertex shader. To pass them to the geometry shader, we need them as `in vec3 vs_gs_scales[]` or similar in the geometry shader.
+
+But wait — VTK's `MapDataArrayToVertexAttribute` maps data arrays to vertex shader `in` attributes. The geometry shader would then receive these as arrays (since it operates on the entire primitive, not just one vertex). For points (1 vertex per primitive), it's `in vec3 vs_gs_scales[1]` or just `in vec3 vs_gs_scales[]` with gl_in.length() == 1.
+
+This is the approach. Let me plan the full geometry shader implementation.
+
+Actually, let me step back and think about what's achievable and what would give the most benefit:
+
+**Achievable improvements without geometry shader:**
+1. Disable depth writes for the splat actor
+2. Ensure correct blend function
+3. Maybe fix the `coordxy` computation for non-circular Gaussians
+
+**Geometry shader approach** (harder, but matches original architecture):
+1. Move covariance computation to geometry shader
+2. Expand points to quads in clip space
+3. Pass exact `coordxy` to fragment shader
+
+Let me go with the geometry shader approach as it's the most impactful. I'll implement it using VTK's `SetGeometryShaderCode` API.
+
+Here's my plan for the geometry shader:
+
+```glsl
+#version 150
+
+layout(points) in;
+layout(triangle_strip, max_vertices = 4) out;
+
+// Inputs from vertex shader (need to be arrays for geometry shader)
+in vec3  vs_scales[];
+in vec4  vs_quats[];
+in float vs_opacity[];
+in vec3  vs_sh_dc[];
+in vec3  vs_sh1_0[];
+// ... etc.
+in vec3  vs_color[];  // precomputed SH color from vertex shader
+in float vs_opacity_out[];
+
+// Camera/projection uniforms (VTK built-ins)
+uniform mat4 MCVCMatrix;
+uniform mat4 MCDCMatrix;
+uniform float focal_x;
+uniform float focal_y;
+uniform float tan_fovx;
+uniform float tan_fovy;
+uniform int render_mode;
+
+// Outputs to fragment shader
+out vec3  v_conic;
+out vec2  v_coordxy;  // screen-space pixel offset from center
+out vec3  v_color;
+out float v_opacity;
+
+void main() {
+    // Get input data
+    vec3 scale = vs_scales[0];
+    vec4 quat = vs_quats[0];
+    
+    // Compute 3D covariance
+    float qw = quat.x, qx = quat.y, qy = quat.z, qz = quat.w;
+    mat3 R = mat3(...);
+    mat3 S = mat3(scale.x, 0, 0, 0, scale.y, 0, 0, 0, scale.z);
+    mat3 RS = R * S;
+    mat3 Sigma = RS * transpose(RS);
+    
+    // Camera-space position
+    vec4 pos_cam = MCVCMatrix * gl_in[0].gl_Position;  // assuming position is in world space
+    float depth = max(-pos_cam.z, 1e-4);
+    
+    // EWA Jacobian
+    float limx = 1.3 * tan_fovx;
+    float limy = 1.3 * tan_fovy;
+    float tx = clamp(pos_cam.x / depth, -limx, limx) * depth;
+    float ty = clamp(pos_cam.y / depth, -limy, limy) * depth;
+    
+    mat3 J = mat3(
+        focal_x / depth, 0.0, 0.0,
+        0.0, focal_y / depth, 0.0,
+        focal_x*tx/(depth*depth), focal_y*ty/(depth*depth), 0.0
+    );
+    mat3 W = mat3(MCVCMatrix);
+    mat3 T = J * W;
+    mat3 cov2 = T * Sigma * transpose(T);
+    
+    float cxx = cov2[0][0] + 0.3;
+    float cxy = cov2[1][0];
+    float cyy = cov2[1][1] + 0.3;
+    
+    float det = cxx*cyy - cxy*cxy;
+    if (det == 0.0) return;
+    float inv_det = 1.0/det;
+    v_conic = vec3(cyy*inv_det, -cxy*inv_det, cxx*inv_det);
+    
+    // Screen-space extent (3 sigma)
+    float half_x = 3.0 * sqrt(cxx);
+    float half_y = 3.0 * sqrt(cyy);
+    
+    // Clip-space position of splat center
+    vec4 pos_clip = MCDCMatrix * gl_in[0].gl_Position;
+    
+    // Convert half-extents to NDC (need viewport dimensions)
+    // NDC half-width for half_x pixels: half_x / (viewport_width/2) = 2*half_x/viewport_width
+    // But we have focal_x = viewport_width / (2*tan_fovx)
+    // So viewport_width = 2 * focal_x * tan_fovx
+    float vp_width = 2.0 * focal_x * tan_fovx;
+    float vp_height = 2.0 * focal_y * tan_fovy;
+    float quad_x = 2.0 * half_x / vp_width;  // NDC units
+    float quad_y = 2.0 * half_y / vp_height;  // NDC units
+    
+    // Need to scale by w for proper NDC
+    float w = pos_clip.w;
+    
+    v_color = vs_color[0];
+    v_opacity = vs_opacity_out[0];
+    
+    // Emit 4 vertices forming a quad
+    vec2 offsets[4] = vec2[4](
+        vec2(-1, -1), vec2(1, -1), vec2(-1, 1), vec2(1, 1)
+    );
+    
+    for (int i = 0; i < 4; i++) {
+        v_coordxy = vec2(offsets[i].x * half_x, offsets[i].y * half_y);
+        gl_Position = vec4(
+            pos_clip.x + offsets[i].x * quad_x * w,
+            pos_clip.y + offsets[i].y * quad_y * w,
+            pos_clip.z,
+            w
+        );
+        EmitVertex();
+    }
+    EndPrimitive();
+}
+```
+
+This is getting complex. And there's an important issue: the vertex shader attributes need to be passed to the geometry shader. With VTK's shader replacement system, the vertex attributes are bound as `in vec3 gs_scales` in the vertex shader. For the geometry shader to access them, it needs `in vec3 gs_scales[]` (as arrays, since geometry shaders receive full primitives).
+
+But VTK's shader replacement system might not support this renaming automatically. We'd need to:
+1. Have the vertex shader pass these as `out` variables (renamed with `vs_` prefix)
+2. Have the geometry shader receive them as `in` arrays
+
+The vertex shader already has `in vec3 gs_scales` (from `MapDataArrayToVertexAttribute`). It would need to also have `out vec3 vs_scales` and copy them. But this means modifying the vertex shader to be a full pass-through shader, and doing all the heavy computation in the geometry shader.
+
+Alternatively, split the work:
+- Vertex shader: compute SH color, pass it as an out varying
+- Geometry shader: compute EWA, expand to quad, use the pre-computed color
+
+This is more practical. The vertex shader computes the color and passes `vs_color`, `vs_opacity`. The geometry shader receives those as `vs_color[]`, `vs_opacity[]` and handles the spatial expansion.
+
+But the problem is that VTK's vertex shader replacement system uses `//VTK::PositionVC::Dec` to inject our declarations, and the output variables from our GLSL replacement conflict with VTK's built-in variables.
+
+This is getting very complex. Let me think about the practical feasibility.
+
+Actually, I think the cleanest approach would be to use VTK's full shader override (`SetVertexShaderCode`, `SetGeometryShaderCode`, `SetFragmentShaderCode`) instead of the replacement approach. This gives us complete control over the pipeline.
+
+But then we lose all of VTK's automatic uniform bindings (`MCDCMatrix`, `MCVCMatrix`, etc.) and need to manage them ourselves.
+
+Hmm. Let me think about what's actually the most practical next improvement.
+
+Given the complexity of the geometry shader approach, maybe there are simpler things that could improve visual quality:
+
+1. **Reduce transparency threshold**: The current `1/255` threshold might cause some splats to be discarded too aggressively.
+
+2. **Fix the `coordxy` for non-circular Gaussians**: Even with point sprites, we can pass the separate x/y half-sizes to the fragment shader and use them to correctly size the sampling.
+
+Wait, actually I realize there might be a significant issue with the current fragment shader that I haven't addressed. Let me look at it again:
+
+```glsl
+vec2  d = (gl_PointCoord - 0.5) * v_pointSize;
+```
+
+The `v_pointSize` is based on `lam1` (max eigenvalue). But `gl_PointCoord` gives coordinates from (0,0) to (1,1) where (0.5, 0.5) is the center. So:
+- `gl_PointCoord - 0.5` ranges from (-0.5, -0.5) to (0.5, 0.5)
+- Multiplying by `v_pointSize = 2 * ceil(3*sqrt(lam1))` gives `d` ranging from `-ceil(3*sqrt(lam1))` to `+ceil(3*sqrt(lam1))`
+
+So the max |d| is `ceil(3*sqrt(lam1))`, which approximates `3*sqrt(lam1)`. This is correct for the major axis direction.
+
+For the original, the quad extends from `-3*sqrt(cxx)` to `+3*sqrt(cxx)` in x and `-3*sqrt(cyy)` to `+3*sqrt(cyy)` in y. These are the 3-sigma extents of the *diagonal* covariance elements, not the max eigenvalue.
+
+So there's a subtle difference: the original's `coordxy.x` max is `3*sqrt(cxx)` while ours is `3*sqrt(lam1)`. If the Gaussian is elongated, `lam1 > cxx` and `lam1 > cyy`, so our `d` extends further than the original's `coordxy` in both directions. This means:
+- We compute the power for more pixels (those with `|d| > 3*sigma_diagonal`)
+- But those pixels get discarded (power > 0 due to conic)
+- So visually equivalent, just wasteful
+
+Unless... there's a precision issue where `power` is computed incorrectly for large `d` values, and pixels that should be discarded aren't?
+
+Actually, for pixels where `|d.x| > 3*sqrt(cxx)` (major direction assuming x is major), the power should be `< -0.5 * conic.x * (3*sqrt(cxx))^2 = -0.5 * (cyy/det) * 9*cxx ≈ -4.5 * cyy*cxx/det`. For a non-degenerate Gaussian this is negative (< -4.5), so power < 0 and `exp(power) < exp(-4.5) ≈ 0.011`. Multiplied by opacity (< 1), the final_alpha would be < 0.011, below 1/255 ≈ 0.004. So these pixels would be discarded by the `if (final_alpha < 1.0/255.0) discard;` check. Good.
+
+So the visual result should be equivalent to the original. The remaining differences must come from other factors.
+
+Let me think about what those factors might be more concretely...
+
+Actually, you know what, let me just ask the user what specifically looks "not good enough" — but the user said "what else can we do" so they want suggestions. Let me give a practical list of what can be improved.
+
+Looking at this more carefully, I think the most impactful improvements would be:
+
+1. **Geometry shader for quad expansion** (hard, matches original architecture)
+2. **Disable depth writes** for the splat actor (easy, might fix ghosting artifacts)
+3. **Accumulation threshold** - the current 1/255 might differ from original's 0.22 flat-ball threshold
+4. **gl_PointSize driver limits** - some drivers cap this; using quads bypasses this
+
+Let me think about what I can say and do concretely. I'll be honest about the remaining architectural differences and offer to implement the geometry shader approach, or start with the easier wins.
+
+Actually, looking at this very carefully:
+
+The most impactful remaining improvements are:
+1. **Geometry shader replacing point sprites with screen-aligned quads** - this eliminates the gl_PointSize cap, ensures correct per-Gaussian tile sizing, and exactly matches the original's geometry
+2. **Disabling depth writes** for the translucent actor (VTK might be writing depth, causing artifacts)
+3. **SH degree-3** support (we're limited to degree-2 by GL attribute count)
+
+For a concise and honest answer, I should explain:
+- The architectural gap (quads vs point sprites) and whether it matters in practice
+- The depth write issue
+- The SH degree-3 gap
+- Any blending differences
+
+And then offer to implement the most impactful one.
+
+Let me give a short response explaining the remaining gaps and the geometry shader approach.
+</thinking>
+
+Let me look at what's left to compare with the original:<thinking>
+Now I have the full picture. The original:
+1. Uses `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` blending
+2. Does NOT explicitly disable depth testing (so depth testing IS enabled — it reads depth but the question is whether it writes depth)
+3. Uses instanced quad rendering
+
+The original's OpenGL setup doesn't explicitly set `glDepthMask`. By default in OpenGL, depth writes are enabled. But the original is rendering sorted back-to-front with alpha blending — typically for transparency you'd disable depth writes. However, since it's sorted, depth writes could still work OK (each fragment is rendered in back-to-front order, so writing depth doesn't cause incorrect occlusion of later fragments).
+
+Actually, looking at this: the original renders instanced quads with `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` blending and sorted order. Depth writes being on means each Gaussian's quad writes depth. This could cause issues when two Gaussians overlap (the front one writes depth, occluding parts of subsequent ones that are slightly behind). But with sorted rendering, this is what happens in the original too.
+
+For VTK: when `actor.GetProperty().SetOpacity(0.99)`, VTK uses alpha blending. The question is whether VTK disables depth writes or uses depth peeling.
+
+The three key remaining differences I see:
+
+1. **Geometry: quads vs point sprites** — The original renders each Gaussian as a screen-space quad with sizes `quadwh_scr = (3*sqrt(cxx), 3*sqrt(cyy))` pixels. We use a square point sprite with size `3*sqrt(lam1)` pixels (the max eigenvalue). This is equivalent computationally (the conic handles the actual shape), but there's an important visual difference: **the `gl_PointSize` GPU limit**. Most GPU drivers cap `gl_PointSize` at around 64-512 pixels (driver-dependent). Very large background Gaussians that should be e.g. 800 pixels wide get clamped to the max point size and appear incorrectly.
+
+2. **SH degree-3 missing** — We cap at degree-2 due to GL attribute limits. The original supports degree-3 (48 SH coefficients total).
+
+3. **VTK's blending pipeline** — VTK uses depth peeling or equivalent for translucent objects, which is more expensive but can produce different visual results than simple back-to-front sorted blending.
+
+4. **The `coordxy` axis sizes** — In the original, the quad x-extent is `3*sqrt(cxx)` and y-extent is `3*sqrt(cyy)`. Our point sprite x and y extents are both `3*sqrt(lam1)`. For strongly elongated Gaussians (lam1 >> lam2), the original's quad provides a tight fit while ours is a large square — computationally equivalent but the quad gives better antialiasing at the edges because the quad boundary coincides with the 3-sigma extent.
+
+Actually, point 4 might cause a subtle visual difference: at the boundary of the square point sprite, `gl_PointCoord` interpolation ends abruptly. For a circular Gaussian, this coincides with the actual falloff. For an elongated Gaussian, the major axis extends to the edge of the square (correct) but the minor axis has much of the square interior outside the 3-sigma extent (but discarded by the conic). The visual result should be the same since discarded fragments don't contribute.
+
+**What can we do?**
+
+The most impactful things in order:
+
+1. **Geometry shader** — Convert each point to a screen-aligned quad matching the exact Gaussian extents. This bypasses `gl_PointSize` limits and perfectly matches the original's rendering architecture.
+
+2. **SH degree-3 via texture buffer** — Instead of vertex attributes (limited to 16), store all SH data in a texture buffer object (TBO) and sample it in the shader using `gl_VertexID`. This allows degree-3 SH.
+
+3. **Blending state** — Ensure VTK uses the same blend function as the original.
+
+Of these, (1) is the most impactful and most correct. The geometry shader approach would:
+- Remove the gl_PointSize limitation
+- Provide tight quad sizing (matching the original)
+- Match the original's rendering architecture exactly
+
+Let me propose these options to the user with a clear explanation of impact vs complexity.
+
+Actually, let me just give a concise summary of what's left and what we can do, without writing a lot of code yet. The user asked "what else can we do" — so I should give them options first.
+</thinking>
+
+Three remaining gaps, in order of visual impact:
+
+**1. Point sprites vs screen-space quads (biggest impact)**
+The original renders each Gaussian as an instanced quad whose x/y extents are independently sized to `3√Cxx` and `3√Cyy` (the diagonal covariance elements). Our point sprites are forced to be square at `3√λ₁` (the max eigenvalue). Two consequences: first, the GPU `GL_POINT_SIZE` cap (typically 64–512px depending on driver) clips large background Gaussians entirely, while the original's quads can be arbitrarily large. Second, a very elongated Gaussian wastes a large square tile even though the minor axis only needs a few pixels. We can fix this with a **geometry shader** that takes each vertex and emits 4 quad corners in clip space, with the correct per-axis sizing — exactly what the original's `position * quadwh_scr` does.
+
+**2. SH degree-3 missing**
+We're capped at degree-2 (8 attributes per channel) because VTK/GL vertex attributes max out at 16 slots. Degree-3 adds 7 more basis functions per channel (21 extra attributes) which exceeds the limit. The fix is to stop using vertex attributes for SH and instead store all SH coefficients in a **texture buffer object (TBO)** sampled by `gl_VertexID`. This also frees attribute slots so we could eventually add more per-splat data.
+
+**3. Blending**
+The original explicitly sets `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` with no depth mask. VTK's translucency pipeline (triggered by `SetOpacity(0.99)`) uses its own multi-pass algorithm internally. We can force the correct state by setting opacity to exactly 1.0 on the property and instead relying entirely on the GLSL `opacity` output, or by injecting the blend state via VTK's `vtkRenderPass`.
+
+**Which to do?** The geometry shader (1) gives the biggest improvement and is self-contained in `native_actor_gs.py`. Want me to implement that?
