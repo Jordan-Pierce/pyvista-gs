@@ -9,3 +9,4 @@ _example.py
 text.py
 toy_cuda_gs.py
 .vscode
+*.ply
