@@ -57,6 +57,7 @@ from native_actor_gs import (
     load_3dgs_as_polydata,
     set_render_mode_on_actor,
     sort_splats_by_depth,
+    update_camera_uniforms,
 )
 
 
@@ -263,6 +264,8 @@ class GaussianSplatWidget(QWidget):
 
     def set_fovy_deg(self, deg: float) -> None:
         self._plotter.camera.view_angle = float(deg)
+        if self._splat_actor is not None:
+            update_camera_uniforms(self._splat_actor, self._plotter)
         self._plotter.render()
 
     def fit_camera_to_gaussians(self) -> None:
@@ -420,6 +423,7 @@ class GaussianSplatWidget(QWidget):
             lighting=False, show_scalar_bar=False, rgb=True, reset_camera=False)
         self._splat_actor.GetProperty().SetOpacity(self._opacity)
         apply_3dgs_shaders(self._splat_actor, self._mesh, self.render_mode)
+        update_camera_uniforms(self._splat_actor, self._plotter)
 
         box = pv.Box(bounds=self._mesh.bounds)
         self._bbox_actor = self._plotter.add_mesh(
@@ -504,6 +508,8 @@ class GaussianSplatWidget(QWidget):
             sort_splats_by_depth(self._plotter, self._mesh)
         except Exception:
             pass
+        if self._splat_actor is not None:
+            update_camera_uniforms(self._splat_actor, self._plotter)
 
     def _maybe_auto_sort(self) -> None:
         if self.auto_sort and self._mesh is not None:

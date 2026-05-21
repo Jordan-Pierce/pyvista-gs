@@ -31,6 +31,8 @@ Correct layout for a degree-3 PLY (n_per_ch=15 per colour channel):
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pyvista as pv
 import vtk
@@ -122,7 +124,7 @@ def load_3dgs_as_polydata(ply_path: str) -> pv.PolyData:
 _VERT_DEC = """
 //VTK::PositionVC::Dec
 
-uniform mat4 MCVCMatrix;
+uniform mat4  MCVCMatrix;
 
 in vec3  gs_scales;
 in vec4  gs_quats;
@@ -164,11 +166,33 @@ vec4  pos_cam = MCVCMatrix * vec4(vertexMC.xyz, 1.0);
 float depth   = max(-pos_cam.z, 1e-4);
 v_depth = depth;
 
-float focal = 800.0;
-float k     = (focal * focal) / (depth * depth);
-float cxx   = Sigma[0][0] * k + 0.3;
-float cyy   = Sigma[1][1] * k + 0.3;
-float cxy   = Sigma[0][1] * k;
+// Clamp splat centre to frustum edges (EWA)
+float limx = 1.3 * tan_fovx;
+float limy = 1.3 * tan_fovy;
+float tx = clamp(pos_cam.x / depth, -limx, limx) * depth;
+float ty = clamp(pos_cam.y / depth, -limy, limy) * depth;
+
+// Jacobian of perspective projection  (GLSL mat3: column-major)
+// Mathematical layout (row × col):
+//   | focal_x/depth   0              focal_x*tx/depth^2 |
+//   | 0               focal_y/depth  focal_y*ty/depth^2 |
+//   | 0               0              0                   |
+mat3 J = mat3(
+    focal_x / depth,           0.0,                        0.0,
+    0.0,                       focal_y / depth,            0.0,
+    focal_x * tx / (depth*depth), focal_y * ty / (depth*depth), 0.0
+);
+
+// Upper-left 3×3 of model-to-camera matrix (view rotation)
+mat3 W = mat3(MCVCMatrix);
+
+// EWA 2-D covariance:  Sigma2D = J * W * Sigma3D * W^T * J^T
+mat3 T    = J * W;
+mat3 cov2 = T * Sigma * transpose(T);
+
+float cxx = cov2[0][0] + 0.3;
+float cxy = cov2[1][0];           // cov2[col=1][row=0] = (0,1) element
+float cyy = cov2[1][1] + 0.3;
 
 float det     = cxx * cyy - cxy * cxy;
 float inv_det = 1.0 / max(det, 1e-7);
@@ -286,12 +310,47 @@ def apply_3dgs_shaders(actor, mesh: pv.PolyData, render_mode: int = 7) -> None:
 
     set_render_mode_on_actor(actor, render_mode)
 
+    # Seed focal uniforms with a reasonable default; call
+    # update_camera_uniforms(actor, plotter) to get exact values.
+    vu = sp.GetVertexCustomUniforms()
+    vu.SetUniformf("focal_x",  800.0)
+    vu.SetUniformf("focal_y",  800.0)
+    vu.SetUniformf("tan_fovx", 0.5)
+    vu.SetUniformf("tan_fovy", 0.5)
+
 
 def set_render_mode_on_actor(actor, render_mode: int) -> None:
     """Update the render_mode uniform on an already-shaded actor."""
     sp = actor.GetShaderProperty()
     sp.GetVertexCustomUniforms().SetUniformi("render_mode", int(render_mode))
     sp.GetFragmentCustomUniforms().SetUniformi("render_mode", int(render_mode))
+
+
+def update_camera_uniforms(actor, plotter) -> None:
+    """Recompute focal-length uniforms from the current camera and viewport.
+
+    Call this whenever the camera moves or the window is resized so that the
+    EWA 2-D covariance projection stays geometrically correct.
+    """
+    try:
+        rw     = plotter.render_window
+        width, height = rw.GetSize()
+        if width == 0 or height == 0:
+            return
+
+        fovy_rad = math.radians(float(plotter.camera.view_angle))
+        tan_fovy = math.tan(fovy_rad * 0.5)
+        tan_fovx = tan_fovy * (width / height)
+        focal_y  = height / (2.0 * tan_fovy)
+        focal_x  = width  / (2.0 * tan_fovx)
+
+        vu = actor.GetShaderProperty().GetVertexCustomUniforms()
+        vu.SetUniformf("focal_x",  float(focal_x))
+        vu.SetUniformf("focal_y",  float(focal_y))
+        vu.SetUniformf("tan_fovx", float(tan_fovx))
+        vu.SetUniformf("tan_fovy", float(tan_fovy))
+    except Exception:
+        pass  # silently ignore if actor/plotter not yet initialised
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +386,13 @@ def main():
                         lighting=False, show_scalar_bar=False, rgb=True)
     actor.GetProperty().SetOpacity(0.99)
     apply_3dgs_shaders(actor, mesh, render_mode=7)
+    update_camera_uniforms(actor, pl)
 
     pl.add_mesh(pv.Box(bounds=mesh.bounds), color="cyan", style="wireframe", line_width=2)
     pl.iren.add_observer("EndInteractionEvent",
-                         lambda *_: (sort_splats_by_depth(pl, mesh), pl.render()))
+                         lambda *_: (sort_splats_by_depth(pl, mesh),
+                                     update_camera_uniforms(actor, pl),
+                                     pl.render()))
     sort_splats_by_depth(pl, mesh)
     pl.show()
 
