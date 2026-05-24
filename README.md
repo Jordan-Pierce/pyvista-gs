@@ -1,4 +1,4 @@
-# pyvista-gspyvista-gs
+# pyvista-gs
 
 PyVista-backed Gaussian Splatting viewer packaged as an installable Python module.
 `GaussianActor` is the main reusable integration point: it can be embedded in
