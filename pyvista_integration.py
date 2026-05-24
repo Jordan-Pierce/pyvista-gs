@@ -62,12 +62,18 @@ class MainWindow(QMainWindow):
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
 
-        # Menu & Status
+       # Menu & Status
         menu = self.menuBar()
         view_menu = menu.addMenu("View")
         toggle_panel = QAction("Show Control Panel", self, checkable=True, checked=True)
         toggle_panel.triggered.connect(dock.setVisible)
         view_menu.addAction(toggle_panel)
+
+        # Tools Menu for Cropping
+        tools_menu = menu.addMenu("Tools")
+        self.action_crop = QAction("Interactive Crop Box", self, checkable=True)
+        self.action_crop.triggered.connect(self._toggle_crop)
+        tools_menu.addAction(self.action_crop)
 
         self._status_bar = self.statusBar()
         self._status_lbl = QLabel("Ready - Please open a .ply file")
@@ -77,6 +83,74 @@ class MainWindow(QMainWindow):
 
         if hidpi:
             QApplication.instance().setFont(QFont(QApplication.font().family(), 14))
+
+    # ─── Tool Interactions ────────────────────────────────────────────── #
+
+    def _toggle_crop(self, state: bool):
+        if not self.gs_actor:
+            self.action_crop.setChecked(False)
+            self.sig_status_message.emit("Please load a model first.")
+            return
+
+        if state:
+            self.plotter.add_box_widget(
+                callback=self._on_crop_box_modified,
+                bounds=self.gs_actor._original_mesh.bounds,
+                color="white",
+                outline_translation=False,
+                pass_widget=False
+            )
+            self.sig_status_message.emit("Cropping enabled. Drag the box faces to slice.")
+        else:
+            self.plotter.clear_box_widgets()
+            self.gs_actor.mesh = self.gs_actor._original_mesh # Restore original mesh
+            self.plotter.update()
+            self.sig_gau_count_changed.emit(self.gaussian_count())
+            self.sig_status_message.emit("Cropping disabled. Restored original volume.")
+
+    def _on_crop_box_modified(self, bounds):
+        if self.gs_actor:
+            self.gs_actor.apply_crop_box(bounds)
+            self.plotter.update()
+            self.sig_gau_count_changed.emit(self.gaussian_count())
+
+    # ─── Core Loading ─────────────────────────────────────────────────── #
+
+    def load_ply(self, path: str):
+        if not os.path.exists(path):
+            self.sig_status_message.emit(f"File not found: {path}")
+            return
+
+        self.sig_loading_changed.emit(True)
+        self.sig_status_message.emit(f"Loading {os.path.basename(path)}...")
+        QApplication.processEvents()
+
+        try:
+            # NEW: Explicitly free VRAM from the old model before loading a new one
+            if self.gs_actor:
+                self.gs_actor.cleanup()
+                self.gs_actor = None
+                self.plotter.clear_box_widgets()
+                self.action_crop.setChecked(False)
+
+            raw_gaussians = util_gau.load_ply(path)
+            
+            centroid = np.mean(raw_gaussians.xyz, axis=0)
+            raw_gaussians.xyz -= centroid
+
+            self.plotter.clear()
+            
+            self.gs_actor = GaussianActor(raw_gaussians)
+            self.gs_actor.bind_to_plotter(self.plotter)
+
+            self.plotter.reset_camera()
+            self.sig_gau_count_changed.emit(self.gaussian_count())
+            self.sig_status_message.emit("Ready")
+            self.plotter.update()
+        except Exception as e:
+            self.sig_status_message.emit(f"Error loading PLY: {e}")
+        finally:
+            self.sig_loading_changed.emit(False)
 
 
     # ─── Mouse Interaction (Qt Event Filter) ──────────────────────────── #

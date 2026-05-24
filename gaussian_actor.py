@@ -49,6 +49,10 @@ class GaussianActor:
         self._sync_needed = True
         self._last_mtime = 0
         
+        # Smart Sort Caching
+        self._last_view_matrix = None
+        self._sort_tolerance = 1e-4
+        
         # 3DGS Configuration
         self.scale_modifier = 1.0
         self.render_mode = 7 
@@ -62,11 +66,24 @@ class GaussianActor:
         self._mesh.point_data['opacity'] = gaussian_data.opacity
         self._mesh.point_data['sh'] = gaussian_data.sh
         
+        # Store a pure backup for non-destructive cropping
+        self._original_mesh = self._mesh.copy()
+        
         # Create the invisible VTK anchor
         self.mapper = pv.DataSetMapper(self._mesh)
         self.actor = pv.Actor(mapper=self.mapper)
-        self.actor.prop.opacity = 0.0     # Hide VTK rendering
-        self.actor.prop.point_size = 5.0  # Keep mathematical size for raycasting
+        self.actor.prop.opacity = 0.0     
+        self.actor.prop.point_size = 5.0  
+
+    def cleanup(self):
+        """Releases the OpenGL renderer resources."""
+        if self.renderer:
+            self.renderer.cleanup()
+            self.renderer = None
+
+    def apply_crop_box(self, bounds):
+        """Clips the original mesh to the given bounds and triggers an update."""
+        self.mesh = self._original_mesh.clip_box(bounds, invert=False)
 
     @property
     def mesh(self) -> pv.PolyData:
@@ -74,10 +91,6 @@ class GaussianActor:
 
     @mesh.setter
     def mesh(self, new_mesh: pv.PolyData):
-        """
-        Allows users to replace the mesh (e.g., gs_actor.mesh = gs_actor.mesh.clip('y')).
-        The actor will automatically detect this and rebuild the OpenGL data.
-        """
         self._mesh = new_mesh
         self.mapper.dataset = self._mesh
         self._sync_needed = True
@@ -87,17 +100,13 @@ class GaussianActor:
         return self._mesh.n_points if self._mesh else 0
 
     def bind_to_plotter(self, plotter: pv.Plotter):
-        """Adds the actor to the PyVista scene and hooks the OpenGL render pipeline."""
         plotter.add_actor(self.actor, pickable=True)
         plotter.renderer.AddObserver(vtk.vtkCommand.EndEvent, self._on_render_end)
 
     def _sync_to_renderer(self):
-        """Extracts surviving VTK arrays and pushes them to the custom OpenGL renderer."""
         if self._mesh.n_points == 0:
             return
 
-        # Safely extract opacity and ensure it maintains an (N, 1) shape. 
-        # VTK flattens single-component arrays to 1D (N,).
         opacity_array = np.array(self._mesh.point_data['opacity'])
         if opacity_array.ndim == 1:
             opacity_array = opacity_array.reshape(-1, 1)
@@ -115,13 +124,9 @@ class GaussianActor:
 
         self._last_mtime = self._mesh.GetMTime()
         self._sync_needed = False
-
-    def sort_gaussians(self, cam_adapter):
-        if self.renderer and self.point_count > 0:
-            self.renderer.sort_and_update(cam_adapter)
+        self._last_view_matrix = None # Force a re-sort upon data change
 
     def pick_gaussian(self, ray_origin: np.ndarray, ray_dir: np.ndarray, fovy_rad: float, window_height: int) -> np.ndarray | None:
-        """Finds the closest Gaussian intersected by the given ray using angular tolerance."""
         if self.point_count == 0:
             return None
 
@@ -129,7 +134,6 @@ class GaussianActor:
         vecs = xyz - ray_origin
         t = np.sum(vecs * ray_dir, axis=1)
 
-        # Only consider points in front of the camera
         front_mask = t > 0
         if not np.any(front_mask):
             return None
@@ -138,29 +142,38 @@ class GaussianActor:
         front_vecs = front_xyz - ray_origin
         front_t = t[front_mask]
 
-        # Calculate angular distance to the ray
         proj = front_t[:, None] * ray_dir
         dists = np.linalg.norm(front_vecs - proj, axis=1)
         angles = dists / front_t
 
-        # Tolerance based on FOV and window height (approx 5 pixels)
         tolerance = 5.0 * (fovy_rad / window_height)
-
         hit_mask = angles < tolerance
+        
         if np.any(hit_mask):
             hit_indices = np.where(hit_mask)[0]
-            # Out of all hits, find the one closest to the camera
             best_idx = hit_indices[np.argmin(front_t[hit_mask])]
             return front_xyz[best_idx]
         
         return None
 
+    def sort_gaussians(self, cam_adapter):
+        if not self.renderer or self.point_count == 0:
+            return
+
+        view_mat = cam_adapter.get_view_matrix()
+        
+        # SMART SORT: Only run radix sort if the camera actually moved
+        if self._last_view_matrix is not None:
+            if np.allclose(view_mat, self._last_view_matrix, atol=self._sort_tolerance):
+                return
+        
+        self.renderer.sort_and_update(cam_adapter)
+        self._last_view_matrix = view_mat.copy()
+
     def _on_render_end(self, caller, event):
-        """Injected immediately after PyVista finishes drawing standard geometry."""
         if self.point_count == 0:
             return
 
-        # Check if mesh has been modified (translated, points deleted, etc.)
         if self._sync_needed or self._mesh.GetMTime() > self._last_mtime:
             self._sync_to_renderer()
 
@@ -169,12 +182,10 @@ class GaussianActor:
         if w == 0 or h == 0:
             return
 
-        # Lazy Init Renderer
         if self.renderer is None:
             self.renderer = OpenGLRenderer(w, h)
             self._sync_to_renderer()
 
-        # Update Settings
         self.renderer.set_scale_modifier(self.scale_modifier)
         self.renderer.set_render_mod(self.render_mode - 4)
         self.renderer.reduce_updates = self.reduce_updates
@@ -186,23 +197,19 @@ class GaussianActor:
         if self.auto_sort:
             self.sort_gaussians(cam_adapter)
 
-        # --- PRESERVE VTK STATE ---
         last_prog = gl.glGetIntegerv(gl.GL_CURRENT_PROGRAM)
         last_vao = gl.glGetIntegerv(gl.GL_VERTEX_ARRAY_BINDING)
         last_blend = gl.glGetBoolean(gl.GL_BLEND)
         last_depth_mask = gl.glGetBoolean(gl.GL_DEPTH_WRITEMASK)
         
-        # --- CONFIGURE 3DGS STATE ---
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         gl.glDepthMask(gl.GL_FALSE) 
         
-        # --- DRAW GAUSSIANS ---
         self.renderer.update_camera_pose(cam_adapter)
         self.renderer.update_camera_intrin(cam_adapter)
         self.renderer.draw()
         
-        # --- RESTORE VTK STATE ---
         if last_depth_mask: gl.glDepthMask(gl.GL_TRUE)
         else: gl.glDepthMask(gl.GL_FALSE)
             

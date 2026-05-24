@@ -195,3 +195,26 @@ class OpenGLRenderer(GaussianRenderBase):
         gl.glBindVertexArray(self.vao)
         num_gau = len(self.gaussians)
         gl.glDrawElementsInstanced(gl.GL_TRIANGLES, len(self.quad_f.reshape(-1)), gl.GL_UNSIGNED_INT, None, num_gau)
+
+    def cleanup(self):
+        """Explicitly free GPU resources to prevent VRAM leaks."""
+        try:
+            if self.program:
+                gl.glDeleteProgram(self.program)
+                self.program = None
+            if self.vao:
+                gl.glDeleteVertexArrays(1, [self.vao])
+                self.vao = None
+            
+            buffers = []
+            if self.gau_bufferid:
+                buffers.append(self.gau_bufferid)
+            if self.index_bufferid:
+                buffers.append(self.index_bufferid)
+            
+            if buffers:
+                gl.glDeleteBuffers(len(buffers), buffers)
+                self.gau_bufferid = None
+                self.index_bufferid = None
+        except Exception as e:
+            print(f"Warning: OpenGL cleanup failed: {e}")
