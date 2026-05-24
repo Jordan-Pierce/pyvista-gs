@@ -3,7 +3,8 @@
 PyVista-backed Gaussian Splatting viewer packaged as an installable Python module.
 `GaussianActor` is the main reusable integration point: it can be embedded in
 other PyVista or Qt applications and behaves like a normal actor from the outside,
-even though the actual splat rendering is handled by a custom OpenGL backend.
+even though the actual splat rendering is handled by a custom OpenGL backend. This
+was a fork from [limacv/GaussianSplattingViewer](https://github.com/limacv/GaussianSplattingViewer).
 
 ![teaser.png](./assets/teaser.png)
 
