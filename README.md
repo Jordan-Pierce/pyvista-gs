@@ -1,4 +1,4 @@
-# pyvista-gs
+# pyvista-gspyvista-gs
 
 PyVista-backed Gaussian Splatting viewer packaged as an installable Python module.
 `GaussianActor` is the main reusable integration point: it can be embedded in
@@ -20,8 +20,8 @@ pip install -e .
 
 ```bash
 pyvista-gs
-python -m gs_viewer
-python -m gs_viewer --hidpi    # 1.5x font scale on HiDPI displays
+python -m pyvista-gs
+python -m pyvista-gs --hidpi    # 1.5x font scale on HiDPI displays
 ```
 
 ## GaussianActor
@@ -29,7 +29,7 @@ python -m gs_viewer --hidpi    # 1.5x font scale on HiDPI displays
 Use `GaussianActor` when you want to add 3D Gaussian splats to an existing app:
 
 ```python
-from gs_viewer import GaussianActor, load_ply
+from pyvista-gs import GaussianActor, load_ply
 
 gaussians = load_ply("/path/to/point_cloud.ply")
 actor = GaussianActor(gaussians)

@@ -24,14 +24,14 @@ dependencies = [
 ]
 
 [project.scripts]
-pyvista-gs = "gs_viewer.app:main"
+pyvista-gs = "pyvista-gs.app:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["gs_viewer*"]
+include = ["pyvista-gs*"]
 
 [tool.setuptools.package-data]
-"gs_viewer.shaders" = ["*.glsl"]
+"pyvista-gs.shaders" = ["*.glsl"]
