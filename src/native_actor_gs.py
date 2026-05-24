@@ -32,7 +32,6 @@ Correct layout for a degree-3 PLY (n_per_ch=15 per colour channel):
 from __future__ import annotations
 
 import math
-
 import numpy as np
 import pyvista as pv
 import vtk
@@ -172,11 +171,7 @@ float limy = 1.3 * tan_fovy;
 float tx = clamp(pos_cam.x / depth, -limx, limx) * depth;
 float ty = clamp(pos_cam.y / depth, -limy, limy) * depth;
 
-// Jacobian of perspective projection  (GLSL mat3: column-major)
-// Mathematical layout (row × col):
-//   | focal_x/depth   0              focal_x*tx/depth^2 |
-//   | 0               focal_y/depth  focal_y*ty/depth^2 |
-//   | 0               0              0                   |
+// Jacobian of perspective projection (GLSL mat3: column-major)
 mat3 J = mat3(
     focal_x / depth,           0.0,                        0.0,
     0.0,                       focal_y / depth,            0.0,
@@ -191,7 +186,7 @@ mat3 T    = J * W;
 mat3 cov2 = T * Sigma * transpose(T);
 
 float cxx = cov2[0][0] + 0.3;
-float cxy = cov2[1][0];           // cov2[col=1][row=0] = (0,1) element
+float cxy = cov2[1][0];
 float cyy = cov2[1][1] + 0.3;
 
 float det     = cxx * cyy - cxy * cxy;

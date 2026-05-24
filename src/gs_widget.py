@@ -186,6 +186,7 @@ class GaussianSplatWidget(QWidget):
         self._original_scales: Optional[np.ndarray] = None
         self._load_thread: Optional[QThread]    = None
         self._load_worker: Optional[_PlyLoader] = None
+        self._is_loading = False
 
         # Loading overlay
         self._overlay = _LoadingOverlay(self)
@@ -198,17 +199,11 @@ class GaussianSplatWidget(QWidget):
         self._fps_timer.setInterval(500)
         self._fps_timer.timeout.connect(self._tick_fps)
         self._fps_timer.start()
-        self._plotter.iren.add_observer("RenderEvent", self._on_render)
+        self._plotter.iren.add_observer("RenderEvent", self._on_render_event)
 
         # Resort on camera stop
         self._plotter.iren.add_observer(
             "EndInteractionEvent", lambda *_: self._resort())
-
-        # Auto-sort timer (80 ms, same period as original)
-        self._sort_timer = QTimer(self)
-        self._sort_timer.setInterval(80)
-        self._sort_timer.timeout.connect(self._maybe_auto_sort)
-        self._sort_timer.start()
 
         # Double-click focal-point picking
         self._picker       = vtk.vtkPointPicker()
@@ -238,10 +233,11 @@ class GaussianSplatWidget(QWidget):
         if not path or not os.path.isfile(path):
             self.sig_status_message.emit(f"File not found: {path}")
             return
-        if self._load_thread is not None and self._load_thread.isRunning():
+        if self._is_loading:
             self.sig_status_message.emit("A load is already in progress…")
             return
 
+        self._is_loading = True
         self.sig_loading_changed.emit(True)
         self.sig_status_message.emit(f"Loading {os.path.basename(path)}…")
         self._overlay.start(path)
@@ -254,6 +250,7 @@ class GaussianSplatWidget(QWidget):
         self._load_worker.finished.connect(self._load_thread.quit)
         self._load_worker.finished.connect(self._load_worker.deleteLater)
         self._load_thread.finished.connect(self._load_thread.deleteLater)
+        self._load_thread.finished.connect(self._clear_load_thread)
         self._load_thread.start()
 
     # -- Camera -------------------------------------------------------------
@@ -366,8 +363,9 @@ class GaussianSplatWidget(QWidget):
     # -- Sorting ------------------------------------------------------------
 
     def sort_gaussians(self) -> None:
-        self._resort()
-        self._plotter.render()
+        if self._mesh is not None:
+            sort_splats_by_depth(self._plotter, self._mesh)
+            self._plotter.render()
 
     # -- Backend (single backend) -------------------------------------------
 
@@ -401,6 +399,7 @@ class GaussianSplatWidget(QWidget):
     @pyqtSlot(object, str)
     def _on_load_finished(self, mesh, error: str) -> None:
         self._overlay.stop()
+        self._is_loading = False
         self.sig_loading_changed.emit(False)
 
         if mesh is None:
@@ -437,6 +436,10 @@ class GaussianSplatWidget(QWidget):
         n = self.gaussian_count()
         self.sig_gau_count_changed.emit(n)
         self.sig_status_message.emit(f"Loaded {n:,} Gaussians.")
+
+    def _clear_load_thread(self) -> None:
+        """Safely clear the thread reference after it has been deleted."""
+        self._load_thread = None
 
     # -- Camera helpers -----------------------------------------------------
 
@@ -528,6 +531,15 @@ class GaussianSplatWidget(QWidget):
         self._frame_count = 0
         self._fps_t0      = now
         self.sig_fps_changed.emit(fps)
+
+    def _on_render_event(self, *_args):
+        if self._splat_actor is not None:
+            update_camera_uniforms(self._splat_actor, self._plotter)
+
+    def _maybe_auto_sort(self):
+        """Legacy timer – now unused because sorting happens on every render event.
+        Keep for compatibility with control panel."""
+        pass
 
     # -----------------------------------------------------------------------
     #  Qt lifecycle
