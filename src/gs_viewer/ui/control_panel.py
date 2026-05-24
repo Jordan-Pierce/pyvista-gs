@@ -192,6 +192,19 @@ class ControlPanel(QWidget):
         scene.layout().addWidget(self._open_btn)
         root.addWidget(scene)
 
+        # ── Crop ──────────────────────────────────────────────────────── #
+        crop = _group("Crop")
+        self._crop_chk = QCheckBox("Crop preview")
+        self._crop_chk.setToolTip("Preview crop bounds in the shader without rebuilding the mesh")
+        self._crop_chk.toggled.connect(self._gw.set_crop_box_enabled)
+        self._apply_crop_btn = QPushButton("Apply Crop")
+        self._apply_crop_btn.clicked.connect(self._gw.apply_crop_box)
+        crop.layout().addWidget(self._crop_chk)
+        crop_btn_row = QHBoxLayout()
+        crop_btn_row.addWidget(self._apply_crop_btn)
+        crop.layout().addLayout(crop_btn_row)
+        root.addWidget(crop)
+
         # ── Camera ────────────────────────────────────────────────────── #
         cam = _group("Camera")
 
@@ -320,6 +333,7 @@ class ControlPanel(QWidget):
         # Collect all interactive controls (disabled during load)
         self._interactive: list[QWidget] = [
             self._open_btn, self._backend_combo,
+            self._crop_chk, self._apply_crop_btn,
             self._fov_slider, self._scale_slider, self._shading_combo,
             *self._focal_spinners,
             self._fit_btn, self._reset_btn, self._flip_btn,

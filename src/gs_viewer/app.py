@@ -341,9 +341,12 @@ class MainWindow(QMainWindow):
         view_menu.addAction(toggle_panel)
 
         tools_menu = menu.addMenu("Tools")
-        self.action_crop = QAction("Interactive Crop Box", self, checkable=True)
+        self.action_crop = QAction("Crop Preview", self, checkable=True)
         self.action_crop.triggered.connect(self._toggle_crop)
         tools_menu.addAction(self.action_crop)
+        self.action_apply_crop = QAction("Apply Crop", self)
+        self.action_apply_crop.triggered.connect(self.apply_crop_box)
+        tools_menu.addAction(self.action_apply_crop)
 
         self._status_bar = self.statusBar()
         self._status_lbl = QLabel("Ready - Please open a .ply file")
@@ -354,8 +357,22 @@ class MainWindow(QMainWindow):
             QApplication.instance().setFont(QFont(QApplication.font().family(), 14))
 
     def _toggle_crop(self, state: bool):
+        self.set_crop_box_enabled(state)
+
+    def _sync_crop_controls(self, enabled: bool):
+        self.action_crop.blockSignals(True)
+        self.action_crop.setChecked(enabled)
+        self.action_crop.blockSignals(False)
+
+        crop_chk = getattr(self._panel, "_crop_chk", None)
+        if crop_chk is not None:
+            crop_chk.blockSignals(True)
+            crop_chk.setChecked(enabled)
+            crop_chk.blockSignals(False)
+
+    def set_crop_box_enabled(self, state: bool):
         if not self.gs_actor:
-            self.action_crop.setChecked(False)
+            self._sync_crop_controls(False)
             self.sig_status_message.emit("Please load a model first.")
             return
 
@@ -367,19 +384,29 @@ class MainWindow(QMainWindow):
                 outline_translation=False,
                 pass_widget=False,
             )
-            self.sig_status_message.emit("Cropping enabled. Drag the box faces to slice.")
+            self.gs_actor.set_crop_bounds(self.gs_actor._original_mesh.bounds)
+            self._sync_crop_controls(True)
+            self.sig_status_message.emit("Crop preview enabled. Drag the box to preview clipping.")
         else:
             self.plotter.clear_box_widgets()
-            self.gs_actor.mesh = self.gs_actor._original_mesh
+            self.gs_actor.clear_crop_box()
             self.plotter.update()
-            self.sig_gau_count_changed.emit(self.gaussian_count())
-            self.sig_status_message.emit("Cropping disabled. Restored original volume.")
+            self._sync_crop_controls(False)
+            self.sig_status_message.emit("Crop preview disabled.")
 
     def _on_crop_box_modified(self, bounds):
         if self.gs_actor:
-            self.gs_actor.apply_crop_box(bounds)
+            self.gs_actor.set_crop_bounds(bounds)
             self.plotter.update()
-            self.sig_gau_count_changed.emit(self.gaussian_count())
+
+    def apply_crop_box(self):
+        if not self.gs_actor:
+            return
+
+        self.gs_actor.apply_crop_box()
+        self.plotter.update()
+        self.sig_gau_count_changed.emit(self.gaussian_count())
+        self.sig_status_message.emit(f"Applied crop. Remaining splats: {self.gaussian_count():,}")
 
     def load_ply(self, path: str):
         if not os.path.exists(path):
@@ -392,10 +419,11 @@ class MainWindow(QMainWindow):
 
         try:
             if self.gs_actor:
+                self.gs_actor.clear_crop_box()
+                self.plotter.clear_box_widgets()
+                self._sync_crop_controls(False)
                 self.gs_actor.cleanup()
                 self.gs_actor = None
-                self.plotter.clear_box_widgets()
-                self.action_crop.setChecked(False)
 
             raw_gaussians = util_gau.load_ply(path)
 

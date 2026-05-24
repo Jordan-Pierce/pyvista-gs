@@ -51,6 +51,9 @@ uniform vec3 cam_pos;
 uniform int sh_dim;
 uniform float scale_modifier;
 uniform int render_mod;  // > 0 render 0-ith SH dim, -1 depth, -2 bill board, -3 gaussian
+uniform int crop_enabled;
+uniform vec3 crop_min;
+uniform vec3 crop_max;
 
 out vec3 color;
 out float alpha;
@@ -118,6 +121,15 @@ void main()
 	int total_dim = 3 + 4 + 3 + 1 + sh_dim;
 	int start = boxid * total_dim;
 	vec4 g_pos = vec4(get_vec3(start + POS_IDX), 1.f);
+	if (crop_enabled == 1 && (any(lessThan(g_pos.xyz, crop_min)) || any(greaterThan(g_pos.xyz, crop_max))))
+	{
+		color = vec3(0.f);
+		alpha = 0.f;
+		conic = vec3(1.f);
+		coordxy = vec2(0.f);
+		gl_Position = vec4(-100, -100, -100, 1);
+		return;
+	}
     vec4 g_pos_view = view_matrix * g_pos;
     vec4 g_pos_screen = projection_matrix * g_pos_view;
 	g_pos_screen.xyz = g_pos_screen.xyz / g_pos_screen.w;

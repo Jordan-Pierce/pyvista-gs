@@ -63,6 +63,43 @@ def _multiply_quaternions_wxyz(left: np.ndarray, right: np.ndarray) -> np.ndarra
     ])
 
 
+def _coerce_crop_bounds(bounds) -> np.ndarray:
+    """Convert a PyVista crop widget payload into xmin/xmax/ymin/ymax/zmin/zmax."""
+    if bounds is None:
+        raise ValueError("Crop bounds cannot be None")
+
+    if hasattr(bounds, "GetBounds"):
+        bounds = bounds.GetBounds()
+    elif hasattr(bounds, "bounds"):
+        bounds = bounds.bounds
+
+    if hasattr(bounds, "points"):
+        points = np.asarray(bounds.points, dtype=np.float64)
+        if points.ndim == 2 and points.shape[1] == 3:
+            mins = points.min(axis=0)
+            maxs = points.max(axis=0)
+            return np.array([mins[0], maxs[0], mins[1], maxs[1], mins[2], maxs[2]], dtype=np.float64)
+
+    bounds_array = np.asarray(bounds, dtype=np.float64)
+
+    if bounds_array.size == 6:
+        return bounds_array.reshape(6)
+
+    if bounds_array.ndim == 2 and bounds_array.shape == (3, 2):
+        return np.array([
+            bounds_array[0, 0], bounds_array[0, 1],
+            bounds_array[1, 0], bounds_array[1, 1],
+            bounds_array[2, 0], bounds_array[2, 1],
+        ], dtype=np.float64)
+
+    if bounds_array.ndim == 2 and bounds_array.shape[1] == 3:
+        mins = bounds_array.min(axis=0)
+        maxs = bounds_array.max(axis=0)
+        return np.array([mins[0], maxs[0], mins[1], maxs[1], mins[2], maxs[2]], dtype=np.float64)
+
+    raise ValueError("Crop bounds must resolve to 6 values")
+
+
 class VTKCameraAdapter:
     """Bridges PyVista's vtkCamera and the util.Camera interface."""
 
@@ -111,6 +148,7 @@ class GaussianActor:
         self.render_mode = 7
         self.auto_sort = True
         self.reduce_updates = True
+        self._crop_bounds: np.ndarray | None = None
 
         self._mesh = pv.PolyData(gaussian_data.xyz)
         self._mesh.point_data['rot'] = gaussian_data.rot
@@ -130,6 +168,19 @@ class GaussianActor:
         if self.renderer:
             self.renderer.cleanup()
             self.renderer = None
+
+    def set_crop_bounds(self, bounds: np.ndarray):
+        """Enable a shader-side crop preview without mutating the mesh."""
+        crop_bounds = _coerce_crop_bounds(bounds)
+        self._crop_bounds = crop_bounds
+        if self.renderer:
+            self.renderer.set_crop_bounds(crop_bounds)
+
+    def clear_crop_box(self):
+        """Disable the crop preview."""
+        self._crop_bounds = None
+        if self.renderer:
+            self.renderer.clear_crop_bounds()
 
     def transform(self, matrix: np.ndarray):
         """
@@ -241,9 +292,41 @@ class GaussianActor:
         self._sync_needed = True
         self._last_view_matrix = None
 
-    def apply_crop_box(self, bounds):
-        """Clip the original mesh to the given bounds and trigger an update."""
-        self.mesh = self._original_mesh.clip_box(bounds, invert=False)
+    def apply_crop_box(self, bounds: np.ndarray | None = None):
+        """
+        Commit the current crop preview by deleting points outside the crop bounds.
+
+        If bounds are provided they become the active preview bounds before the commit.
+        """
+        if bounds is not None:
+            self.set_crop_bounds(bounds)
+
+        if self._crop_bounds is None or self.point_count == 0:
+            return
+
+        crop_bounds = np.asarray(self._crop_bounds, dtype=np.float64)
+        points = np.asarray(self._mesh.points, dtype=np.float64)
+        valid_mask = (
+            (points[:, 0] >= crop_bounds[0]) & (points[:, 0] <= crop_bounds[1]) &
+            (points[:, 1] >= crop_bounds[2]) & (points[:, 1] <= crop_bounds[3]) &
+            (points[:, 2] >= crop_bounds[4]) & (points[:, 2] <= crop_bounds[5])
+        )
+
+        if not np.any(valid_mask):
+            print("Crop aborted: The current crop bounds would delete the entire model.")
+            return
+
+        points_removed = valid_mask.size - int(np.sum(valid_mask))
+        if points_removed == 0:
+            return
+
+        culled_mesh = self._mesh.extract_points(valid_mask)
+        self.mesh = culled_mesh
+        self._original_mesh = culled_mesh.copy()
+        self._sync_needed = True
+        self._last_view_matrix = None
+
+        print(f"Applied crop: removed {points_removed:,} splats. Remaining splats: {self.point_count:,}")
 
     @property
     def mesh(self) -> pv.PolyData:
@@ -346,6 +429,7 @@ class GaussianActor:
             self.renderer = OpenGLRenderer(w, h)
             self._sync_to_renderer()
 
+        self.renderer.set_crop_bounds(self._crop_bounds)
         self.renderer.set_scale_modifier(self.scale_modifier)
         self.renderer.set_render_mod(self.render_mode - 4)
         self.renderer.reduce_updates = self.reduce_updates

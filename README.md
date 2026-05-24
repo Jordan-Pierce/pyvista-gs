@@ -35,6 +35,10 @@ actor = GaussianActor(gaussians)
 actor.bind_to_plotter(plotter)
 ```
 
+`GaussianActor` also supports non-destructive crop preview through
+`set_crop_bounds(...)`, with an explicit `apply_crop_box()` commit step when you
+want to permanently remove the splats outside the box.
+
 The "hack" is that `GaussianActor` builds an invisible `pv.PolyData`/
 `pv.Actor` anchor and then hooks PyVista's render-end callback to sync and draw
 with the custom OpenGL renderer. To the rest of your application it looks like a

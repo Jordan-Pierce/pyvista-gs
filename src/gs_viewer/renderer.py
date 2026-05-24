@@ -139,6 +139,7 @@ class OpenGLRenderer(GaussianRenderBase):
         super().__init__()
         gl.glViewport(0, 0, w, h)
         self.program = util.load_shaders(VS_PATH, FS_PATH)
+        self._crop_bounds: np.ndarray | None = None
 
         self.quad_v = np.array([
             -1, 1,
@@ -168,6 +169,28 @@ class OpenGLRenderer(GaussianRenderBase):
             wglSwapIntervalEXT(1 if self.reduce_updates else 0)
         else:
             print("VSync is not supported")
+
+    def set_crop_bounds(self, bounds):
+        if bounds is None:
+            self._crop_bounds = None
+            return
+
+        crop_bounds = np.asarray(bounds, dtype=np.float32).ravel()
+        if crop_bounds.size != 6:
+            raise ValueError("Crop bounds must contain 6 values: xmin, xmax, ymin, ymax, zmin, zmax")
+        self._crop_bounds = crop_bounds
+
+    def clear_crop_bounds(self):
+        self._crop_bounds = None
+
+    def _upload_crop_uniforms(self):
+        enabled = 1 if self._crop_bounds is not None else 0
+        util.set_uniform_1int(self.program, enabled, "crop_enabled")
+        if self._crop_bounds is not None:
+            crop_min = np.array([self._crop_bounds[0], self._crop_bounds[2], self._crop_bounds[4]], dtype=np.float32)
+            crop_max = np.array([self._crop_bounds[1], self._crop_bounds[3], self._crop_bounds[5]], dtype=np.float32)
+            util.set_uniform_v3(self.program, crop_min, "crop_min")
+            util.set_uniform_v3(self.program, crop_max, "crop_max")
 
     def update_gaussian_data(self, gaus: util_gau.GaussianData):
         self.gaussians = gaus
@@ -213,6 +236,7 @@ class OpenGLRenderer(GaussianRenderBase):
 
     def draw(self):
         gl.glUseProgram(self.program)
+        self._upload_crop_uniforms()
         gl.glBindVertexArray(self.vao)
         num_gau = len(self.gaussians)
         gl.glDrawElementsInstanced(gl.GL_TRIANGLES, len(self.quad_f.reshape(-1)), gl.GL_UNSIGNED_INT, None, num_gau)
