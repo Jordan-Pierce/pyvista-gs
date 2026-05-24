@@ -417,6 +417,10 @@ class GaussianActor:
         if self.point_count == 0:
             return
 
+        # Honor the VTK actor visibility flag so external code can hide/show splats
+        if not self.actor.GetVisibility():
+            return
+
         if self._sync_needed or self._mesh.GetMTime() > self._last_mtime:
             self._sync_to_renderer()
 
