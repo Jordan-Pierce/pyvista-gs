@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyvista-gs"
+version = "0.1.0"
+description = "A PyVista-backed interactive 3D Gaussian Splatting viewer."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Li Ma" }
+]
+dependencies = [
+    "numpy",
+    "pyvista",
+    "pyvistaqt",
+    "PyQt5",
+    "PyOpenGL",
+    "PyOpenGL_accelerate",
+    "plyfile",
+    "PyGLM",
+]
+
+[project.scripts]
+pyvista-gs = "gs_viewer.app:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gs_viewer*"]
+
+[tool.setuptools.package-data]
+"gs_viewer.shaders" = ["*.glsl"]

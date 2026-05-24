@@ -1,53 +1,47 @@
-# Gaussian Splatting Viewer — PyQt5 Edition
+# pyvista-gs
 
-Rewrite of the original GLFW/ImGui viewer as a self-contained **PyQt5 widget**,
-ready to be embedded in any larger Qt application.
+PyVista-backed Gaussian Splatting viewer packaged as an installable Python module.
+`GaussianActor` is the main reusable integration point: it can be embedded in
+other PyVista or Qt applications and behaves like a normal actor from the outside,
+even though the actual splat rendering is handled by a custom OpenGL backend.
 
 ![teaser.png](./assets/teaser.png)
 
 ## Install
 
 ```bash
-pip install PyQt5 PyOpenGL PyOpenGL_accelerate numpy imageio plyfile PyGLM
-# for CUDA renderer:
-# pip install torch  (CUDA build)
+pip install -e .
+# if/when published to PyPI:
+# pip install pyvista-gs
 ```
 
 ## Run
 
 ```bash
-python main.py
-python main.py --hidpi    # 1.5× font scale on HiDPI displays
+pyvista-gs
+python -m gs_viewer
+python -m gs_viewer --hidpi    # 1.5x font scale on HiDPI displays
 ```
 
-## Embedding in another application
+## GaussianActor
 
-`GaussianWidget` is a plain `QOpenGLWidget` subclass — drop it anywhere:
+Use `GaussianActor` when you want to add 3D Gaussian splats to an existing app:
 
 ```python
-from gaussian_widget import GaussianWidget
-from control_panel   import ControlPanel
+from gs_viewer import GaussianActor, load_ply
 
-# In your own QMainWindow / QDialog / QSplitter:
-viewer = GaussianWidget()
-panel  = ControlPanel(viewer)
-
-# Load a scene programmatically:
-viewer.load_ply("/path/to/point_cloud.ply")
+gaussians = load_ply("/path/to/point_cloud.ply")
+actor = GaussianActor(gaussians)
+actor.bind_to_plotter(plotter)
 ```
 
-Signals emitted by `GaussianWidget`:
-- `sig_fps_changed(float)`        — current frames-per-second
-- `sig_gau_count_changed(int)`    — number of loaded Gaussians
-- `sig_status_message(str)`       — human-readable status string
+The "hack" is that `GaussianActor` builds an invisible `pv.PolyData`/
+`pv.Actor` anchor and then hooks PyVista's render-end callback to sync and draw
+with the custom OpenGL renderer. To the rest of your application it looks like a
+first-class PyVista actor, but the splats are still rendered by our own backend.
 
-## Key architecture decisions
+If you want the full window instead of embedding, import `MainWindow`. If you
+want the reusable Qt sidebar in your own app, import `ControlPanel`.
 
-| Problem | Solution |
-|---|---|
-| GL context timing | All GL construction lives in `initializeGL()`, never `__init__` |
-| GL calls from UI thread | `makeCurrent()` / `doneCurrent()` guards around every out-of-paintGL call |
-| Render loop | `QTimer(interval=16)` → `update()` ≈ 60 fps; `reduce_updates` flag passes through to renderer |
-| CUDA context | `QSurfaceFormat` set to OpenGL 4.3 Core **before** `QApplication` is constructed |
-| Mouse tracking | `camera.first_mouse = True` reset on each `mousePressEvent` to prevent jump |
-| Auto-sort | Second `QTimer(interval=80ms)` calls `sort_and_update` when enabled |
+Optional CUDA sorting backends (`torch` or `cupy`) are detected at runtime and
+used only when installed.
