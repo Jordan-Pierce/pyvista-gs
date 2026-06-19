@@ -119,6 +119,11 @@ class VTKProxyActor:
         if program is None:
             return
 
+        # Drain any stale GL errors left by VTK's pipeline so PyOpenGL's
+        # error checker doesn't attribute them to our calls.
+        while gl.glGetError() != gl.GL_NO_ERROR:
+            pass
+
         if not self._ssbo_ready:
             ids = gl.glGenBuffers(2)
             self._data_ssbo = int(ids[0])
