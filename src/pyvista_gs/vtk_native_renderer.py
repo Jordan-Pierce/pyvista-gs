@@ -18,6 +18,7 @@ from vtkmodules.util.misc import calldata_type
 from vtkmodules.vtkCommonCore import VTK_OBJECT
 
 from . import data as util_gau
+from .renderer import _sort_gaussian
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -385,29 +386,7 @@ class VTKNativeGaussianRenderer:
             self._index_ssbo = int(ids[1])
             self._ssbo_ready = True
 
-        # Upload data
-        if self._data_dirty and self._pending_data is not None:
-            gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, self._data_ssbo)
-            gl.glBufferData(gl.GL_SHADER_STORAGE_BUFFER,
-                            self._pending_data.nbytes,
-                            self._pending_data, gl.GL_DYNAMIC_DRAW)
-            self._data_dirty = False
-
-        # Upload sort indices
-        if self._index_dirty and self._pending_index is not None:
-            gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, self._index_ssbo)
-            gl.glBufferData(gl.GL_SHADER_STORAGE_BUFFER,
-                            self._pending_index.nbytes,
-                            self._pending_index, gl.GL_DYNAMIC_DRAW)
-            gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, 0)
-            self._index_dirty = False
-
-        # Bind SSBOs to shader
-        if self._ssbo_ready:
-            gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, 0, self._data_ssbo)
-            gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, 1, self._index_ssbo)
-
-        # Extract camera uniforms
+        # Compute camera matrices first — needed for depth sort
         vtk_cam = self._vtk_renderer.GetActiveCamera()
         size = self._vtk_renderer.GetSize()
         w, h = max(size[0], 1), max(size[1], 1)
@@ -432,6 +411,38 @@ class VTKNativeGaussianRenderer:
         proj_mat = np.array(glm.perspective(
             fovy_rad, float(aspect), 0.01, 100.0,
         ), dtype=np.float32)
+
+        # Depth-sort Gaussians back-to-front before uploading the index buffer
+        if self._sort_needed and self._gaussians is not None:
+            try:
+                sorted_idx = _sort_gaussian(self._gaussians, view_mat)
+                self._pending_index = sorted_idx.reshape(-1).astype(np.int32)
+                self._index_dirty = True
+            except Exception as e:
+                print(f"Gaussian sort error: {e}")
+            self._sort_needed = False
+
+        # Upload data SSBO
+        if self._data_dirty and self._pending_data is not None:
+            gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, self._data_ssbo)
+            gl.glBufferData(gl.GL_SHADER_STORAGE_BUFFER,
+                            self._pending_data.nbytes,
+                            self._pending_data, gl.GL_DYNAMIC_DRAW)
+            self._data_dirty = False
+
+        # Upload sort-index SSBO
+        if self._index_dirty and self._pending_index is not None:
+            gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, self._index_ssbo)
+            gl.glBufferData(gl.GL_SHADER_STORAGE_BUFFER,
+                            self._pending_index.nbytes,
+                            self._pending_index, gl.GL_DYNAMIC_DRAW)
+            gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, 0)
+            self._index_dirty = False
+
+        # Bind SSBOs to shader
+        if self._ssbo_ready:
+            gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, 0, self._data_ssbo)
+            gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, 1, self._index_ssbo)
 
         pid = program.GetHandle()
 
