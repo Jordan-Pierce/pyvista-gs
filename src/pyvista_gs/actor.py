@@ -158,6 +158,11 @@ class GaussianActor:
 
         self._original_mesh = self._mesh.copy()
 
+        # Pristine, never-tinted copy of the SH coefficients. tint_gaussians()
+        # mutates both _mesh and _original_mesh, so neither is a clean baseline
+        # for re-colouring. reset_colors() restores from this snapshot.
+        self._pristine_sh = np.asarray(gaussian_data.sh, dtype=np.float32).copy()
+
         self._proxy = VTKProxyActor()
         self._proxy.update_data(gaussian_data)
 
@@ -243,6 +248,26 @@ class GaussianActor:
         self._last_view_matrix = None
 
         print(f"Culled {points_removed:,} floaters. Remaining splats: {self.point_count:,}")
+
+    def reset_colors(self):
+        """
+        Restore the original (pristine) SH colours, discarding any tints.
+
+        Use this before re-applying a fresh set of tints (e.g. per-class label
+        colours) so that repeated tint_gaussians() calls do not accumulate /
+        blend on top of one another. No-op if the pristine snapshot no longer
+        matches the current splat count (e.g. after a crop/floater cull).
+        """
+        if self.point_count == 0 or self._pristine_sh is None:
+            return
+        if self._pristine_sh.shape[0] != self.point_count:
+            return
+
+        sh = self._pristine_sh.copy()
+        self._mesh.point_data['sh'] = sh
+        self._original_mesh.point_data['sh'] = sh.copy()
+        self._sync_needed = True
+        self._last_view_matrix = None
 
     def tint_gaussians(self, indices: np.ndarray, color_rgb: tuple[int, int, int], blend_factor: float = 0.6):
         """

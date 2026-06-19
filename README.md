@@ -135,5 +135,5 @@ it alongside the main viewer on the same PLY file to compare:
 python examples/vtk_native_sh_broken.py path/to/splat.ply
 
 # Working hybrid rendering (correct colors)
-python -m pyvista_gs path/to/splat.ply
+python -m pyvista_gs
 ```
