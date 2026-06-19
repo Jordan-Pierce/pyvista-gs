@@ -431,6 +431,7 @@ class MainWindow(QMainWindow):
             raw_gaussians.xyz -= centroid
 
             self.plotter.clear()
+            self.plotter.add_axes()
 
             self.gs_actor = GaussianActor(raw_gaussians)
             self.gs_actor.bind_to_plotter(self.plotter)

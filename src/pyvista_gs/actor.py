@@ -374,8 +374,9 @@ class GaussianActor:
         self.actor.Modified()
 
     def bind_to_plotter(self, plotter: pv.Plotter):
+        self._plotter = plotter
         self._proxy.attach_to_renderer(plotter.renderer)
-        plotter.renderer.AddObserver(vtk.vtkCommand.EndEvent, self._on_render_end)
+        plotter.render_window.AddObserver(vtk.vtkCommand.EndEvent, self._on_render_end)
 
     def _sync_to_renderer(self):
         if self._mesh.n_points == 0:
@@ -473,14 +474,17 @@ class GaussianActor:
         if self._sync_needed or self._mesh.GetMTime() > self._last_mtime:
             self._sync_to_renderer()
 
-        window = caller.GetRenderWindow()
-        w, h = window.GetSize()
+        w, h = caller.GetSize()
         if w == 0 or h == 0:
             return
 
         if self.renderer is None:
             self.renderer = ModernGLRenderer(w, h)
             self._sync_to_renderer()
+
+        # Restore the full-window viewport — the axes overlay renderer
+        # may have left a small corner viewport active.
+        self.renderer.ctx.viewport = (0, 0, w, h)
 
         self.renderer.set_crop_bounds(self._crop_bounds)
         self.renderer.set_scale_modifier(self.scale_modifier)
@@ -490,7 +494,7 @@ class GaussianActor:
 
         self._proxy.set_scale_modifier(self.scale_modifier)
 
-        vtk_cam = caller.GetActiveCamera()
+        vtk_cam = self._plotter.renderer.GetActiveCamera()
         cam_adapter = VTKCameraAdapter(vtk_cam, w, h)
 
         try:

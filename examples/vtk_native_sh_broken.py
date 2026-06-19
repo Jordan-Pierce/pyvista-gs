@@ -318,6 +318,7 @@ class VTKNativeGaussianRenderer:
         self._scale_modifier = 1.0
         self._render_mod = 3
         self._sh_dim = 3
+        self._debug_dumped = False
 
         self._data_ssbo: int | None = None
         self._index_ssbo: int | None = None
@@ -345,7 +346,7 @@ class VTKNativeGaussianRenderer:
 
         self._actor = vtk.vtkActor()
         self._actor.SetMapper(self._mapper)
-        self._actor.ForceTranslucentOn()
+        self._actor.ForceOpaqueOn()
         self._actor.GetProperty().SetOpacity(1.0)
         self._actor.GetProperty().SetPointSize(1)
 
@@ -383,6 +384,16 @@ class VTKNativeGaussianRenderer:
         self._data_dirty = True
         self._index_dirty = True
         self._sort_needed = True
+
+        # Data sanity: are the raw magnitudes the shader will read reasonable?
+        sh = np.asarray(gaus.sh, dtype=np.float32).reshape(n, -1)
+        dc = sh[:, 0:3]
+        dc_rgb = 0.28209479177387814 * dc + 0.5  # what DC-only color resolves to
+        opa = np.asarray(gaus.opacity, dtype=np.float32).ravel()
+        print(f"[DATA] n={n}  sh_dim={self._sh_dim}  sh cols={sh.shape[1]}")
+        print(f"[DATA] DC coeff   min/mean/max = {dc.min():.3f} / {dc.mean():.3f} / {dc.max():.3f}")
+        print(f"[DATA] DC->rgb    min/mean/max = {dc_rgb.min():.3f} / {dc_rgb.mean():.3f} / {dc_rgb.max():.3f}")
+        print(f"[DATA] opacity    min/mean/max = {opa.min():.3f} / {opa.mean():.3f} / {opa.max():.3f}")
 
     def _on_update_shader(self, _caller, _event, calldata):
         program = calldata
@@ -458,6 +469,50 @@ class VTKNativeGaussianRenderer:
         ), dtype=np.float32)
 
         pid = program.GetHandle()
+
+        # ── One-shot diagnostic dump ───────────────────────────────────────
+        # Bisection for the "blown out SH" bug: if cam_pos is -1 (or the value
+        # never reaches the geometry stage) then `dir` is garbage and only the
+        # view-dependent SH bands blow out, while DC (render_mod 0) stays sane.
+        if not self._debug_dumped:
+            self._debug_dumped = True
+            print("\n[SH-DEBUG] linked program handle:", pid)
+            for name in ("view_matrix", "projection_matrix", "cam_pos",
+                         "hfovxy_focal", "scale_modifier", "sh_dim", "render_mod"):
+                loc = gl.glGetUniformLocation(pid, name)
+                print(f"[SH-DEBUG]   uniform {name!r:18} -> location {loc}")
+            print(f"[SH-DEBUG] cam_pos value being uploaded: {pos.tolist()}")
+            print(f"[SH-DEBUG] render_mod = {self._render_mod}, sh_dim = {self._sh_dim}")
+
+            # ── Read the GL blend/depth state VTK configured for this draw ──
+            _blend_modes = {
+                gl.GL_ZERO: "ZERO", gl.GL_ONE: "ONE",
+                gl.GL_SRC_ALPHA: "SRC_ALPHA",
+                gl.GL_ONE_MINUS_SRC_ALPHA: "ONE_MINUS_SRC_ALPHA",
+                gl.GL_DST_ALPHA: "DST_ALPHA",
+                gl.GL_ONE_MINUS_DST_ALPHA: "ONE_MINUS_DST_ALPHA",
+                gl.GL_SRC_COLOR: "SRC_COLOR", gl.GL_DST_COLOR: "DST_COLOR",
+            }
+            def _bm(v):
+                return _blend_modes.get(int(v), f"0x{int(v):x}")
+            blend_on = bool(gl.glIsEnabled(gl.GL_BLEND))
+            depth_on = bool(gl.glIsEnabled(gl.GL_DEPTH_TEST))
+            src_rgb = gl.glGetIntegerv(gl.GL_BLEND_SRC_RGB)
+            dst_rgb = gl.glGetIntegerv(gl.GL_BLEND_DST_RGB)
+            src_a = gl.glGetIntegerv(gl.GL_BLEND_SRC_ALPHA)
+            dst_a = gl.glGetIntegerv(gl.GL_BLEND_DST_ALPHA)
+            eq_rgb = gl.glGetIntegerv(gl.GL_BLEND_EQUATION_RGB)
+            depth_mask = gl.glGetIntegerv(gl.GL_DEPTH_WRITEMASK)
+            depth_peel = self._vtk_renderer.GetUseDepthPeeling()
+            srgb = self._vtk_renderer.GetRenderWindow().GetUseSRGBColorSpace()
+            print(f"[GLSTATE] BLEND enabled      = {blend_on}")
+            print(f"[GLSTATE] blend RGB func      = {_bm(src_rgb)} , {_bm(dst_rgb)}")
+            print(f"[GLSTATE] blend ALPHA func    = {_bm(src_a)} , {_bm(dst_a)}")
+            print(f"[GLSTATE] blend equation RGB  = 0x{int(eq_rgb):x} (FUNC_ADD=0x{int(gl.GL_FUNC_ADD):x})")
+            print(f"[GLSTATE] DEPTH_TEST enabled  = {depth_on} , depth write mask = {bool(depth_mask)}")
+            print(f"[GLSTATE] renderer UseDepthPeeling = {bool(depth_peel)}")
+            print(f"[GLSTATE] window UseSRGBColorSpace  = {bool(srgb)}\n")
+
         self._set_mat4(pid, "view_matrix", view_mat)
         self._set_mat4(pid, "projection_matrix", proj_mat)
         self._set_v3(pid, "cam_pos", pos)
@@ -466,6 +521,28 @@ class VTKNativeGaussianRenderer:
         self._set_1f(pid, "scale_modifier", self._scale_modifier)
         self._set_1i(pid, "sh_dim", self._sh_dim)
         self._set_1i(pid, "render_mod", self._render_mod)
+
+        # ── Force 3DGS-correct alpha blending ──────────────────────────────
+        # By rendering in the opaque pass (ForceOpaqueOn), we bypass VTK's
+        # Order-Independent Transparency (OIT) accumulation scheme and own the
+        # blend state directly.  Standard over-blending now works correctly.
+        ostate = self._vtk_renderer.GetRenderWindow().GetState()
+        ostate.vtkglEnable(gl.GL_BLEND)
+        ostate.vtkglEnable(gl.GL_DEPTH_TEST)
+        ostate.vtkglBlendFuncSeparate(
+            gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA,
+            gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA,
+        )
+        ostate.vtkglDepthMask(gl.GL_FALSE)
+
+        if not getattr(self, "_blend_verified", False):
+            self._blend_verified = True
+            src_rgb = gl.glGetIntegerv(gl.GL_BLEND_SRC_RGB)
+            dst_rgb = gl.glGetIntegerv(gl.GL_BLEND_DST_RGB)
+            print(f"[GLSTATE] after override: blend RGB func = "
+                  f"0x{int(src_rgb):x} , 0x{int(dst_rgb):x} "
+                  f"(SRC_ALPHA=0x{int(gl.GL_SRC_ALPHA):x}, "
+                  f"ONE_MINUS_SRC_ALPHA=0x{int(gl.GL_ONE_MINUS_SRC_ALPHA):x})")
 
     @staticmethod
     def _set_mat4(pid, name, mat):
@@ -507,6 +584,16 @@ def main():
         print(f"File not found: {ply_path}")
         sys.exit(1)
 
+    # Optional second arg: render_mod override for the SH bisection.
+    #   0 -> DC term only (view-independent, does NOT use cam_pos/dir)
+    #   3 -> full SH bands (uses cam_pos/dir; this is where it blows out)
+    render_mod_override = None
+    if len(sys.argv) >= 3:
+        try:
+            render_mod_override = int(sys.argv[2])
+        except ValueError:
+            print(f"Ignoring non-integer render_mod arg: {sys.argv[2]!r}")
+
     from qtpy.QtWidgets import QApplication
     app = QApplication.instance() or QApplication(sys.argv)
 
@@ -517,6 +604,9 @@ def main():
     gaussians.xyz -= gaussians.xyz.mean(axis=0)
 
     renderer = VTKNativeGaussianRenderer(plotter.renderer)
+    if render_mod_override is not None:
+        renderer._render_mod = render_mod_override
+        print(f"[SH-DEBUG] render_mod overridden to {render_mod_override}")
     renderer.load(gaussians)
 
     plotter.reset_camera()
