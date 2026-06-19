@@ -13,47 +13,44 @@ Originally forked from
 
 ## Architecture
 
-pyvista-gs uses a **hybrid VTK + ModernGL** rendering architecture. A single
-`GaussianActor` owns two subsystems that work together each frame:
+pyvista-gs uses a **single-pass VTK-native** rendering architecture. A
+`GaussianActor` is a true `vtkActor` that participates fully in VTK's scene
+graph:
 
 ```
-GaussianActor
-├── VTK Proxy Actor (scene participation)
-│   ├── Real vtkActor added to the VTK renderer
-│   ├── Geometry shader emits correctly-sized billboard quads
-│   ├── Fragment shader discards all pixels (invisible)
-│   └── Provides bounds, picking, and depth ordering to VTK
-│
-├── ModernGL Renderer (visual output)
-│   ├── Draws splats with correct Spherical Harmonics evaluation
-│   ├── Renders via EndEvent callback after VTK's own pass
-│   └── Supports view-dependent color (SH bands 0–3)
-│
-└── Shared sort: depth-sorted once per frame, indices fed to both
+GaussianActor (vtkActor)
+├── vtkPolyData: one vertex per Gaussian centre
+├── Geometry shader: reads attributes from SSBOs
+│   ├── Covariance projection (3D→2D splatting)
+│   ├── Spherical Harmonics color evaluation (bands 0–3)
+│   └── Emits billboard quads sized for correct coverage
+├── Fragment shader: Gaussian falloff + alpha blending
+└── Rendered in VTK's opaque pass (not translucent OIT)
+    ├── Receives scene depth via depth test
+    ├── Composites correctly with scene geometry
+    └── Participates in picking and bounding-box queries
 ```
 
-**Why two renderers?** VTK's shader replacement pipeline (geometry shader) can
-emit correctly-sized quads for scene participation, but its SH color evaluation
-produces blown-out results. ModernGL's vertex shader handles SH correctly, but
-VTK can't see actors drawn outside its pipeline. The hybrid gives us both:
-correct visuals *and* full VTK scene citizenship.
+**Why single-pass?** The key insight was that VTK's **translucent pass uses
+Order-Independent Transparency (OIT) with an accumulation buffer**, which
+clobbered per-draw blend-state overrides. Moving the actor to the **opaque
+pass** (via `ForceOpaqueOn()`) gives direct control of blend state. With
+correct `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blending applied before the draw, the
+Spherical Harmonics evaluation now produces correct (non-blown-out) colors
+**in the geometry shader**, matching the working ModernGL implementation
+exactly. This eliminated the need for a hybrid workaround.
 
-### VTK Proxy
+### Rendering Pipeline
 
-The proxy is a `vtkActor` backed by a `vtkPolyData` with one vertex per
-Gaussian centre. A geometry shader reads per-Gaussian attributes (position,
-rotation, scale, opacity) from SSBOs and emits billboard quads sized by the
-3D→2D covariance projection — the same math used for visual rendering. The
-fragment shader unconditionally `discard`s every pixel, so the proxy is
-invisible during normal rendering. During VTK's hardware pick pass, VTK
-replaces the fragment shader with its own, making the quads hittable.
-
-### ModernGL Renderer
-
-After VTK finishes its render pass, an `EndEvent` callback hands control to the
-ModernGL renderer. It draws instanced quads with full Spherical Harmonics
-evaluation (bands 0–3), producing view-dependent color. Blending is enabled and
-depth writes are disabled so splats composite correctly over VTK's framebuffer.
+1. **Per-frame depth sort**: Gaussians sorted back-to-front by camera position
+2. **GPU SSBO upload**: Position, rotation, scale, opacity, and SH coefficients
+   transferred to device-side shader storage buffers
+3. **Geometry shader rasterization**: One point per Gaussian → four-vertex
+   billboard quad, with covariance-based sizing and SH color lookup
+4. **Fragment shader alpha blending**: Gaussian falloff mask, alpha-blended
+   composite into scene framebuffer
+5. **VTK scene integration**: Full depth testing, picking support, and
+   compositing with other VTK actors
 
 ## Install
 
@@ -108,32 +105,27 @@ reusable Qt sidebar in your own app, import `ControlPanel`.
 Optional CUDA sorting backends (`torch` or `cupy`) are detected at runtime and
 used automatically when installed. Falls back to NumPy CPU sorting otherwise.
 
-## Contributing: help us remove the hybrid workaround
+## Technical Deep Dive: Solving "Blown-Out SH" in VTK's Geometry Shader
 
-The hybrid architecture exists because we haven't been able to get Spherical
-Harmonics evaluation working correctly inside VTK's geometry shader. The SH
-math itself is straightforward, but running it in the geometry shader (which
-processes one primitive at a time with limited I/O) produces blown-out,
-incorrect colors compared to the identical math in a standard vertex shader.
+The original architecture was a hybrid VTK + ModernGL workaround due to
+SH color evaluation producing blown-out results in VTK's geometry shader. After
+systematic debugging, the root cause was identified:
 
-If the SH evaluation worked correctly in VTK's shader replacement pipeline, we
-could drop the ModernGL renderer entirely and have Gaussian splats as a true
-single-pass VTK actor — simpler code, one fewer dependency, and better
-integration with VTK's depth buffer and compositing.
+**The Problem:** VTK's **translucent pass** (used for alpha-blended geometry)
+employs **Order-Independent Transparency (OIT)** with a multi-pass accumulation
+buffer scheme. Per-draw blend-function overrides are ineffective in OIT because
+the actual framebuffer draw happens during a later composite pass, not during
+your callback. The actor saw `ONE, ONE` (additive) blending from VTK's OIT
+setup, which summed splat colors to white, masking the real (dim) SH-evaluated
+colors underneath.
 
-**PRs are welcome** that fix the SH color evaluation in the VTK geometry shader
-so it matches the output of
-[gau_vert.glsl](src/pyvista_gs/shaders/gau_vert.glsl).
+**The Solution:** Render in VTK's **opaque pass** via `ForceOpaqueOn()`. The
+opaque pass does a single, straightforward draw with no accumulation — the blend
+state you set **sticks** and is used directly. Switching from additive to
+`SRC_ALPHA, ONE_MINUS_SRC_ALPHA` (standard translucency) revealed that the SH
+math was correct all along; the geometry shader implementation is byte-identical
+to the working vertex shader version.
 
-A self-contained reproduction script is included at
-[examples/vtk_native_sh_broken.py](examples/vtk_native_sh_broken.py). It
-renders splats as a single-pass VTK actor with the broken SH evaluation — run
-it alongside the main viewer on the same PLY file to compare:
-
-```bash
-# Broken single-pass VTK rendering (blown-out colors)
-python examples/vtk_native_sh_broken.py path/to/splat.ply
-
-# Working hybrid rendering (correct colors)
-python -m pyvista_gs path/to/splat.ply
-```
+**Key Insight:** The issue was not precision, not matrix conventions, not data,
+and not the SH coefficients. It was **VTK's rendering pass selection**. Once
+that was fixed, the single-pass actor worked perfectly.

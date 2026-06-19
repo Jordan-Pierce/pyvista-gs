@@ -1,52 +1,37 @@
-"""
-Minimal reproduction of broken SH evaluation in VTK's geometry shader.
+"""Single-pass VTK-native 3D Gaussian Splatting renderer.
 
-This script renders Gaussian splats as a **single-pass VTK actor** using full
-shader replacement on vtkOpenGLPolyDataMapper.  The geometry shader performs
-covariance projection (quad sizing) AND Spherical Harmonics color evaluation.
-
-The SH math is identical to the working vertex shader in gau_vert.glsl, but
-when executed in the geometry shader the colors come out blown-out / incorrect.
-We have not been able to determine whether this is a precision issue, a
-matrix-convention mismatch in the geometry stage, or something else entirely.
-
-If you can fix this so the output matches pyvista-gs's ModernGL renderer, the
-hybrid architecture can be replaced with a single-pass VTK actor.  See the
-README's "Contributing" section.
-
-Usage:
-    python examples/vtk_native_sh_broken.py path/to/point_cloud.ply
-
-Requirements:
-    pip install pyvista pyvistaqt numpy PyOpenGL PyGLM
+This replaces the hybrid VTK proxy + ModernGL architecture with a true
+single-pass vtkActor that renders Gaussians inside VTK's rendering pipeline.
+The key fix: render in the opaque pass (ForceOpaqueOn) to bypass VTK's
+Order-Independent Transparency (OIT) accumulation buffer, allowing direct
+control over blend state.
 """
 from __future__ import annotations
 
-import sys
 import os
-
 import numpy as np
 import vtk
-import pyvista as pv
-from pyvistaqt import QtInteractor
+from OpenGL import GL as gl
+import glm
 from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.util.misc import calldata_type
 from vtkmodules.vtkCommonCore import VTK_OBJECT
-from OpenGL import GL as gl
-import glm
 
-# ---------------------------------------------------------------------------
-# Add src/ to path so we can reuse the data loader and sort function
-# ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from pyvista_gs.data import GaussianData, load_ply  # noqa: E402
-from pyvista_gs.renderer import _sort_gaussian       # noqa: E402
+from . import data as util_gau
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Inline VTK shaders — the geometry shader contains the broken SH evaluation
-# ═══════════════════════════════════════════════════════════════════════════════
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VERT_SHADER = """\
+
+def _read_shader(name: str) -> str:
+    """Read a shader from the shaders/ directory."""
+    with open(os.path.join(MODULE_DIR, 'shaders', name), 'r', encoding='utf-8') as fh:
+        return fh.read()
+
+
+# Inline geometry and fragment shaders with full SH evaluation
+# (vertex shader uses VTK's default positioning)
+
+_VERT_SHADER = """\
 #version 430 core
 
 layout(location = 0) in vec4 vertexMC;
@@ -60,10 +45,7 @@ void main()
 }
 """
 
-# This geometry shader is the problematic one.  The SH evaluation (search for
-# "Spherical Harmonics" below) produces blown-out colors.  Everything else
-# (covariance, quad emission, opacity) works correctly.
-GEOM_SHADER = """\
+_GEOM_SHADER = """\
 #version 430 core
 
 #define SH_C0  0.28209479177387814f
@@ -193,8 +175,6 @@ void main()
     vec2 quadwh_ndc = quadwh_scr / wh * 2.f;
 
     // ── Spherical Harmonics color evaluation ──────────────────────────
-    // THIS IS THE BROKEN PART.  The math is identical to gau_vert.glsl
-    // but produces blown-out / incorrect colors in the geometry shader.
     vec3 color;
     if (render_mod == -1) {
         float depth = -g_pos_view.z;
@@ -257,7 +237,7 @@ void main()
 }
 """
 
-FRAG_SHADER = """\
+_FRAG_SHADER = """\
 #version 430 core
 
 in vec3  frag_color;
@@ -299,26 +279,21 @@ void main()
 """
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# VTK-native Gaussian renderer (single-pass, broken SH)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class VTKNativeGaussianRenderer:
-    """Single-pass VTK actor with full shader replacement.
+    """Single-pass VTK actor rendering Gaussians with full SH evaluation.
 
-    This is the approach we *want* to work — one vtkActor that both renders
-    correct splats and participates in VTK's scene graph.  Currently the SH
-    colors are wrong.
+    Replaces the hybrid VTK proxy + ModernGL architecture. Renders in VTK's
+    opaque pass to bypass Order-Independent Transparency (OIT), allowing
+    correct blend state control.
     """
 
     def __init__(self, vtk_renderer: vtk.vtkRenderer):
         self._vtk_renderer = vtk_renderer
-        self._gaussians: GaussianData | None = None
+        self._gaussians: util_gau.GaussianData | None = None
 
         self._scale_modifier = 1.0
         self._render_mod = 3
         self._sh_dim = 3
-        self._debug_dumped = False
 
         self._data_ssbo: int | None = None
         self._index_ssbo: int | None = None
@@ -338,12 +313,6 @@ class VTKNativeGaussianRenderer:
         self._mapper = vtk.vtkOpenGLPolyDataMapper()
         self._mapper.SetInputData(self._poly)
 
-        @calldata_type(VTK_OBJECT)
-        def _on_shader(caller, event, calldata):
-            self._on_update_shader(caller, event, calldata)
-
-        self._mapper.AddObserver("UpdateShaderEvent", _on_shader)
-
         self._actor = vtk.vtkActor()
         self._actor.SetMapper(self._mapper)
         self._actor.ForceOpaqueOn()
@@ -351,21 +320,24 @@ class VTKNativeGaussianRenderer:
         self._actor.GetProperty().SetPointSize(1)
 
         sp = self._actor.GetShaderProperty()
-        sp.SetVertexShaderCode(VERT_SHADER)
-        sp.SetGeometryShaderCode(GEOM_SHADER)
-        sp.SetFragmentShaderCode(FRAG_SHADER)
+        sp.SetVertexShaderCode(_VERT_SHADER)
+        sp.SetGeometryShaderCode(_GEOM_SHADER)
+        sp.SetFragmentShaderCode(_FRAG_SHADER)
+
+        @calldata_type(VTK_OBJECT)
+        def _on_shader(caller, event, calldata):
+            self._on_update_shader(caller, event, calldata)
+
+        self._mapper.AddObserver("UpdateShaderEvent", _on_shader)
 
         vtk_renderer.AddActor(self._actor)
-        vtk_renderer.GetActiveCamera().AddObserver(
-            vtk.vtkCommand.ModifiedEvent,
-            lambda *_: setattr(self, '_sort_needed', True),
-        )
 
     @property
     def actor(self) -> vtk.vtkActor:
         return self._actor
 
-    def load(self, gaus: GaussianData):
+    def load(self, gaus: util_gau.GaussianData):
+        """Load Gaussian data into the renderer."""
         self._gaussians = gaus
         self._sh_dim = gaus.sh_dim
         n = len(gaus)
@@ -375,7 +347,7 @@ class VTKNativeGaussianRenderer:
         cells[0::2] = 1
         cells[1::2] = np.arange(n)
         verts = vtk.vtkCellArray()
-        verts.SetCells(n, numpy_to_vtk(cells, deep=True, array_type=vtk.VTK_ID_TYPE))
+        verts.ImportLegacyFormat(numpy_to_vtk(cells, deep=True, array_type=vtk.VTK_ID_TYPE))
         self._poly.SetVerts(verts)
         self._poly.Modified()
 
@@ -385,45 +357,35 @@ class VTKNativeGaussianRenderer:
         self._index_dirty = True
         self._sort_needed = True
 
-        # Data sanity: are the raw magnitudes the shader will read reasonable?
-        sh = np.asarray(gaus.sh, dtype=np.float32).reshape(n, -1)
-        dc = sh[:, 0:3]
-        dc_rgb = 0.28209479177387814 * dc + 0.5  # what DC-only color resolves to
-        opa = np.asarray(gaus.opacity, dtype=np.float32).ravel()
-        print(f"[DATA] n={n}  sh_dim={self._sh_dim}  sh cols={sh.shape[1]}")
-        print(f"[DATA] DC coeff   min/mean/max = {dc.min():.3f} / {dc.mean():.3f} / {dc.max():.3f}")
-        print(f"[DATA] DC->rgb    min/mean/max = {dc_rgb.min():.3f} / {dc_rgb.mean():.3f} / {dc_rgb.max():.3f}")
-        print(f"[DATA] opacity    min/mean/max = {opa.min():.3f} / {opa.mean():.3f} / {opa.max():.3f}")
+    def set_scale_modifier(self, modifier: float):
+        """Set the scale modifier for all splats."""
+        self._scale_modifier = float(modifier)
+
+    def set_render_mod(self, mod: int):
+        """Set the render mode (-4..3, maps from UI index via index-4)."""
+        self._render_mod = int(mod)
+
+    def trigger_sort(self):
+        """Mark that splats need re-sorting on the next render."""
+        self._sort_needed = True
 
     def _on_update_shader(self, _caller, _event, calldata):
         program = calldata
         if program is None:
             return
 
+        # Clear any stale GL errors
         while gl.glGetError() != gl.GL_NO_ERROR:
             pass
 
+        # Initialize SSBOs on first shader compile
         if not self._ssbo_ready:
             ids = gl.glGenBuffers(2)
             self._data_ssbo = int(ids[0])
             self._index_ssbo = int(ids[1])
             self._ssbo_ready = True
 
-        if self._sort_needed and self._gaussians is not None:
-            vtk_cam = self._vtk_renderer.GetActiveCamera()
-            pos = np.array(vtk_cam.GetPosition(), dtype=np.float32)
-            focal = np.array(vtk_cam.GetFocalPoint(), dtype=np.float32)
-            up = np.array(vtk_cam.GetViewUp(), dtype=np.float32)
-            view_mat = np.array(glm.lookAt(
-                glm.vec3(*pos.tolist()),
-                glm.vec3(*focal.tolist()),
-                glm.vec3(*up.tolist()),
-            ), dtype=np.float32)
-            idx = _sort_gaussian(self._gaussians, view_mat)
-            self._pending_index = idx.flatten().astype(np.int32)
-            self._index_dirty = True
-            self._sort_needed = False
-
+        # Upload data
         if self._data_dirty and self._pending_data is not None:
             gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, self._data_ssbo)
             gl.glBufferData(gl.GL_SHADER_STORAGE_BUFFER,
@@ -431,6 +393,7 @@ class VTKNativeGaussianRenderer:
                             self._pending_data, gl.GL_DYNAMIC_DRAW)
             self._data_dirty = False
 
+        # Upload sort indices
         if self._index_dirty and self._pending_index is not None:
             gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, self._index_ssbo)
             gl.glBufferData(gl.GL_SHADER_STORAGE_BUFFER,
@@ -439,10 +402,12 @@ class VTKNativeGaussianRenderer:
             gl.glBindBuffer(gl.GL_SHADER_STORAGE_BUFFER, 0)
             self._index_dirty = False
 
+        # Bind SSBOs to shader
         if self._ssbo_ready:
             gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, 0, self._data_ssbo)
             gl.glBindBufferBase(gl.GL_SHADER_STORAGE_BUFFER, 1, self._index_ssbo)
 
+        # Extract camera uniforms
         vtk_cam = self._vtk_renderer.GetActiveCamera()
         size = self._vtk_renderer.GetSize()
         w, h = max(size[0], 1), max(size[1], 1)
@@ -470,62 +435,16 @@ class VTKNativeGaussianRenderer:
 
         pid = program.GetHandle()
 
-        # ── One-shot diagnostic dump ───────────────────────────────────────
-        # Bisection for the "blown out SH" bug: if cam_pos is -1 (or the value
-        # never reaches the geometry stage) then `dir` is garbage and only the
-        # view-dependent SH bands blow out, while DC (render_mod 0) stays sane.
-        if not self._debug_dumped:
-            self._debug_dumped = True
-            print("\n[SH-DEBUG] linked program handle:", pid)
-            for name in ("view_matrix", "projection_matrix", "cam_pos",
-                         "hfovxy_focal", "scale_modifier", "sh_dim", "render_mod"):
-                loc = gl.glGetUniformLocation(pid, name)
-                print(f"[SH-DEBUG]   uniform {name!r:18} -> location {loc}")
-            print(f"[SH-DEBUG] cam_pos value being uploaded: {pos.tolist()}")
-            print(f"[SH-DEBUG] render_mod = {self._render_mod}, sh_dim = {self._sh_dim}")
-
-            # ── Read the GL blend/depth state VTK configured for this draw ──
-            _blend_modes = {
-                gl.GL_ZERO: "ZERO", gl.GL_ONE: "ONE",
-                gl.GL_SRC_ALPHA: "SRC_ALPHA",
-                gl.GL_ONE_MINUS_SRC_ALPHA: "ONE_MINUS_SRC_ALPHA",
-                gl.GL_DST_ALPHA: "DST_ALPHA",
-                gl.GL_ONE_MINUS_DST_ALPHA: "ONE_MINUS_DST_ALPHA",
-                gl.GL_SRC_COLOR: "SRC_COLOR", gl.GL_DST_COLOR: "DST_COLOR",
-            }
-            def _bm(v):
-                return _blend_modes.get(int(v), f"0x{int(v):x}")
-            blend_on = bool(gl.glIsEnabled(gl.GL_BLEND))
-            depth_on = bool(gl.glIsEnabled(gl.GL_DEPTH_TEST))
-            src_rgb = gl.glGetIntegerv(gl.GL_BLEND_SRC_RGB)
-            dst_rgb = gl.glGetIntegerv(gl.GL_BLEND_DST_RGB)
-            src_a = gl.glGetIntegerv(gl.GL_BLEND_SRC_ALPHA)
-            dst_a = gl.glGetIntegerv(gl.GL_BLEND_DST_ALPHA)
-            eq_rgb = gl.glGetIntegerv(gl.GL_BLEND_EQUATION_RGB)
-            depth_mask = gl.glGetIntegerv(gl.GL_DEPTH_WRITEMASK)
-            depth_peel = self._vtk_renderer.GetUseDepthPeeling()
-            srgb = self._vtk_renderer.GetRenderWindow().GetUseSRGBColorSpace()
-            print(f"[GLSTATE] BLEND enabled      = {blend_on}")
-            print(f"[GLSTATE] blend RGB func      = {_bm(src_rgb)} , {_bm(dst_rgb)}")
-            print(f"[GLSTATE] blend ALPHA func    = {_bm(src_a)} , {_bm(dst_a)}")
-            print(f"[GLSTATE] blend equation RGB  = 0x{int(eq_rgb):x} (FUNC_ADD=0x{int(gl.GL_FUNC_ADD):x})")
-            print(f"[GLSTATE] DEPTH_TEST enabled  = {depth_on} , depth write mask = {bool(depth_mask)}")
-            print(f"[GLSTATE] renderer UseDepthPeeling = {bool(depth_peel)}")
-            print(f"[GLSTATE] window UseSRGBColorSpace  = {bool(srgb)}\n")
-
+        # Set uniforms
         self._set_mat4(pid, "view_matrix", view_mat)
         self._set_mat4(pid, "projection_matrix", proj_mat)
         self._set_v3(pid, "cam_pos", pos)
-        self._set_v3(pid, "hfovxy_focal",
-                     np.array([htanx, htany, focal_len], np.float32))
+        self._set_v3(pid, "hfovxy_focal", np.array([htanx, htany, focal_len], np.float32))
         self._set_1f(pid, "scale_modifier", self._scale_modifier)
         self._set_1i(pid, "sh_dim", self._sh_dim)
         self._set_1i(pid, "render_mod", self._render_mod)
 
-        # ── Force 3DGS-correct alpha blending ──────────────────────────────
-        # By rendering in the opaque pass (ForceOpaqueOn), we bypass VTK's
-        # Order-Independent Transparency (OIT) accumulation scheme and own the
-        # blend state directly.  Standard over-blending now works correctly.
+        # Set up correct blend state and depth testing for the opaque pass
         ostate = self._vtk_renderer.GetRenderWindow().GetState()
         ostate.vtkglEnable(gl.GL_BLEND)
         ostate.vtkglEnable(gl.GL_DEPTH_TEST)
@@ -534,15 +453,6 @@ class VTKNativeGaussianRenderer:
             gl.GL_ONE, gl.GL_ONE_MINUS_SRC_ALPHA,
         )
         ostate.vtkglDepthMask(gl.GL_FALSE)
-
-        if not getattr(self, "_blend_verified", False):
-            self._blend_verified = True
-            src_rgb = gl.glGetIntegerv(gl.GL_BLEND_SRC_RGB)
-            dst_rgb = gl.glGetIntegerv(gl.GL_BLEND_DST_RGB)
-            print(f"[GLSTATE] after override: blend RGB func = "
-                  f"0x{int(src_rgb):x} , 0x{int(dst_rgb):x} "
-                  f"(SRC_ALPHA=0x{int(gl.GL_SRC_ALPHA):x}, "
-                  f"ONE_MINUS_SRC_ALPHA=0x{int(gl.GL_ONE_MINUS_SRC_ALPHA):x})")
 
     @staticmethod
     def _set_mat4(pid, name, mat):
@@ -569,51 +479,22 @@ class VTKNativeGaussianRenderer:
         if loc >= 0:
             gl.glUniform1i(loc, int(v))
 
+    def cleanup(self):
+        """Release GPU resources."""
+        if self._vtk_renderer is not None and self._actor is not None:
+            self._vtk_renderer.RemoveActor(self._actor)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Minimal viewer
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python examples/vtk_native_sh_broken.py <path/to/point_cloud.ply>")
-        sys.exit(1)
-
-    ply_path = sys.argv[1]
-    if not os.path.isfile(ply_path):
-        print(f"File not found: {ply_path}")
-        sys.exit(1)
-
-    # Optional second arg: render_mod override for the SH bisection.
-    #   0 -> DC term only (view-independent, does NOT use cam_pos/dir)
-    #   3 -> full SH bands (uses cam_pos/dir; this is where it blows out)
-    render_mod_override = None
-    if len(sys.argv) >= 3:
         try:
-            render_mod_override = int(sys.argv[2])
-        except ValueError:
-            print(f"Ignoring non-integer render_mod arg: {sys.argv[2]!r}")
+            buffers = []
+            if self._data_ssbo is not None:
+                buffers.append(self._data_ssbo)
+            if self._index_ssbo is not None:
+                buffers.append(self._index_ssbo)
+            if buffers:
+                gl.glDeleteBuffers(len(buffers), buffers)
+        except Exception:
+            pass
 
-    from qtpy.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication(sys.argv)
-
-    plotter = pv.Plotter()
-    plotter.set_background("black")
-
-    gaussians = load_ply(ply_path)
-    gaussians.xyz -= gaussians.xyz.mean(axis=0)
-
-    renderer = VTKNativeGaussianRenderer(plotter.renderer)
-    if render_mod_override is not None:
-        renderer._render_mod = render_mod_override
-        print(f"[SH-DEBUG] render_mod overridden to {render_mod_override}")
-    renderer.load(gaussians)
-
-    plotter.reset_camera()
-    plotter.show(title="VTK-native Gaussian Splatting (broken SH)")
-
-    sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
+        self._ssbo_ready = False
+        self._data_ssbo = None
+        self._index_ssbo = None

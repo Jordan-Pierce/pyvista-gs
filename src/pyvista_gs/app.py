@@ -12,7 +12,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QEvent
 from PyQt5.QtGui import QFont, QSurfaceFormat, QPalette, QColor
 
 from . import data as util_gau
-from .actor import GaussianActor, VTKCameraAdapter
+from .actor import GaussianActor
 from .ui.control_panel import ControlPanel
 
 
@@ -431,6 +431,7 @@ class MainWindow(QMainWindow):
             raw_gaussians.xyz -= centroid
 
             self.plotter.clear()
+            self.plotter.add_axes()
 
             self.gs_actor = GaussianActor(raw_gaussians)
             self.gs_actor.bind_to_plotter(self.plotter)
@@ -557,9 +558,7 @@ class MainWindow(QMainWindow):
 
     def sort_gaussians(self):
         if self.gs_actor:
-            w, h = self.plotter.window_size
-            cam_adapter = VTKCameraAdapter(self.plotter.camera, w, h)
-            self.gs_actor.sort_gaussians(cam_adapter)
+            self.gs_actor.sort_gaussians()
             self.plotter.update()
 
     def save_image(self):
