@@ -178,9 +178,8 @@ class GaussianActor:
         self._original_mesh.point_data['rot'] = new_rots.copy()
         self._mesh.point_data['scale'] = new_scales
         self._original_mesh.point_data['scale'] = new_scales.copy()
-
-        self._sync_needed = True
         self._last_view_matrix = None
+        self._sync_to_renderer()
 
     def remove_floaters(self, min_opacity: float = 0.05, max_scale: float = 1.0):
         """
@@ -205,18 +204,17 @@ class GaussianActor:
         culled_mesh = self._mesh.extract_points(valid_mask)
         self.mesh = culled_mesh
         self._original_mesh = culled_mesh.copy()
-        self._sync_needed = True
         self._last_view_matrix = None
+        self._sync_to_renderer()
 
         print(f"Culled {points_removed:,} floaters. Remaining splats: {self.point_count:,}")
 
-    def reset_colors(self):
+    def reset_colors(self, element_ids=None):
         """
         Restore the original (pristine) SH colours, discarding any tints.
 
-        Use this before re-applying a fresh set of tints (e.g. per-class label
-        colours) so that repeated tint_gaussians() calls do not accumulate /
-        blend on top of one another. No-op if the pristine snapshot no longer
+        If ``element_ids`` is provided only those splats are reset; otherwise
+        all splats are restored.  No-op if the pristine snapshot no longer
         matches the current splat count (e.g. after a crop/floater cull).
         """
         if self.point_count == 0 or self._pristine_sh is None:
@@ -224,11 +222,16 @@ class GaussianActor:
         if self._pristine_sh.shape[0] != self.point_count:
             return
 
-        sh = self._pristine_sh.copy()
+        sh = np.asarray(self._mesh.point_data['sh'], dtype=np.float32).copy()
+        if element_ids is not None:
+            sel = np.asarray(element_ids)
+            sh[sel] = self._pristine_sh[sel]
+        else:
+            sh = self._pristine_sh.copy()
+
         self._mesh.point_data['sh'] = sh
         self._original_mesh.point_data['sh'] = sh.copy()
-        self._sync_needed = True
-        self._last_view_matrix = None
+        self._sync_to_renderer()
 
     def tint_gaussians(self, indices: np.ndarray, color_rgb: tuple[int, int, int], blend_factor: float = 0.6):
         """
@@ -266,8 +269,7 @@ class GaussianActor:
         tinted_sh = current_sh.astype(np.float32)
         self._mesh.point_data['sh'] = tinted_sh
         self._original_mesh.point_data['sh'] = tinted_sh.copy()
-        self._sync_needed = True
-        self._last_view_matrix = None
+        self._sync_to_renderer()
 
     def apply_crop_box(self, bounds: np.ndarray | None = None):
         """
@@ -298,8 +300,8 @@ class GaussianActor:
         culled_mesh = self._mesh.extract_points(valid_mask)
         self.mesh = culled_mesh
         self._original_mesh = culled_mesh.copy()
-        self._sync_needed = True
         self._last_view_matrix = None
+        self._sync_to_renderer()
 
         print(f"Applied crop: removed {points_removed:,} splats. Remaining splats: {self.point_count:,}")
 
@@ -386,9 +388,6 @@ class GaussianActor:
         self._renderer.set_scale_modifier(self._scale_modifier)
         self._renderer.set_render_mod(self._render_mode - 4)
         self.actor = self._renderer.actor
-        
-        # Reset camera to frame the splats and trigger initial render
-        plotter.reset_camera()
         
         # Trigger depth sorting when camera moves (respects auto_sort flag)
         plotter.renderer.GetActiveCamera().AddObserver(
