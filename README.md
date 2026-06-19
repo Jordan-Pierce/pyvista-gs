@@ -129,6 +129,3 @@ to the working vertex shader version.
 **Key Insight:** The issue was not precision, not matrix conventions, not data,
 and not the SH coefficients. It was **VTK's rendering pass selection**. Once
 that was fixed, the single-pass actor worked perfectly.
-
-This resolves the "Contributing" section below and eliminates the need for a
-hybrid architecture — `GaussianActor` is now a true single-pass `vtkActor`.
