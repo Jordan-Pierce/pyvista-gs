@@ -558,9 +558,7 @@ class MainWindow(QMainWindow):
 
     def sort_gaussians(self):
         if self.gs_actor:
-            w, h = self.plotter.window_size
-            cam_adapter = VTKCameraAdapter(self.plotter.camera, w, h)
-            self.gs_actor.sort_gaussians(cam_adapter)
+            self.gs_actor.sort_gaussians()
             self.plotter.update()
 
     def save_image(self):

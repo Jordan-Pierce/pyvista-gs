@@ -115,7 +115,8 @@ class GaussianActor:
         self._last_view_matrix = None
         self._sort_tolerance = 1e-4
 
-        self.scale_modifier = 1.0
+        self._scale_modifier = 1.0
+        self._render_mode = 7
         self.auto_sort = True
         self._crop_bounds: np.ndarray | None = None
 
@@ -141,17 +142,12 @@ class GaussianActor:
             self._renderer = None
 
     def set_crop_bounds(self, bounds: np.ndarray):
-        """Enable a shader-side crop preview without mutating the mesh."""
-        crop_bounds = _coerce_crop_bounds(bounds)
-        self._crop_bounds = crop_bounds
-        if self.renderer:
-            self.renderer.set_crop_bounds(crop_bounds)
+        """Store crop bounds for use by apply_crop_box()."""
+        self._crop_bounds = _coerce_crop_bounds(bounds)
 
     def clear_crop_box(self):
-        """Disable the crop preview."""
+        """Clear stored crop bounds."""
         self._crop_bounds = None
-        if self.renderer:
-            self.renderer.clear_crop_bounds()
 
     def transform(self, matrix: np.ndarray):
         """
@@ -338,6 +334,38 @@ class GaussianActor:
         self.actor.SetScale(*scale_factor)
         self.actor.Modified()
 
+    @property
+    def scale_modifier(self) -> float:
+        return self._scale_modifier
+
+    @scale_modifier.setter
+    def scale_modifier(self, value: float):
+        self._scale_modifier = float(value)
+        if self._renderer:
+            self._renderer.set_scale_modifier(self._scale_modifier)
+
+    @property
+    def render_mode(self) -> int:
+        return self._render_mode
+
+    @render_mode.setter
+    def render_mode(self, mode: int):
+        self._render_mode = int(mode)
+        if self._renderer:
+            self._renderer.set_render_mod(self._render_mode - 4)
+
+    @property
+    def reduce_updates(self) -> bool:
+        return False
+
+    @reduce_updates.setter
+    def reduce_updates(self, val: bool):
+        pass
+
+    def sort_gaussians(self):
+        if self._renderer:
+            self._renderer.trigger_sort()
+
     def bind_to_plotter(self, plotter: pv.Plotter):
         """Attach this actor to a PyVista plotter and begin rendering."""
         self._plotter = plotter
@@ -355,15 +383,17 @@ class GaussianActor:
             sh=np.array(self._mesh.point_data['sh']),
         )
         self._renderer.load(gaussian_data)
+        self._renderer.set_scale_modifier(self._scale_modifier)
+        self._renderer.set_render_mod(self._render_mode - 4)
         self.actor = self._renderer.actor
         
         # Reset camera to frame the splats and trigger initial render
         plotter.reset_camera()
         
-        # Trigger depth sorting when camera moves
+        # Trigger depth sorting when camera moves (respects auto_sort flag)
         plotter.renderer.GetActiveCamera().AddObserver(
             vtk.vtkCommand.ModifiedEvent,
-            lambda *_: self._renderer.trigger_sort() if self._renderer else None,
+            lambda *_: self._renderer.trigger_sort() if (self._renderer and self.auto_sort) else None,
         )
 
     def _sync_to_renderer(self):

@@ -77,6 +77,7 @@ uniform vec3  hfovxy_focal;
 uniform vec3  cam_pos;
 uniform int   sh_dim;
 uniform float scale_modifier;
+uniform int   render_mod;
 
 out vec3  frag_color;
 out float frag_alpha;
@@ -175,39 +176,46 @@ void main()
 
     // ── Spherical Harmonics color evaluation ──────────────────────────
     vec3 color;
-    int  sh_start = start + SH_IDX;
-    vec3 dir      = normalize(g_pos.xyz - cam_pos);
-    color         = SH_C0 * get_vec3(sh_start);
+    if (render_mod == -1) {
+        float depth = -g_pos_view.z;
+        depth = (depth < 0.05f) ? 1.f : depth;
+        depth = 1.f / depth;
+        color = vec3(depth, depth, depth);
+    } else {
+        int  sh_start = start + SH_IDX;
+        vec3 dir      = normalize(g_pos.xyz - cam_pos);
+        color         = SH_C0 * get_vec3(sh_start);
 
-    if (sh_dim > 3) {
-        float x = dir.x, y = dir.y, z = dir.z;
-        color += -SH_C1 * y * get_vec3(sh_start + 3)
-               +  SH_C1 * z * get_vec3(sh_start + 6)
-               -  SH_C1 * x * get_vec3(sh_start + 9);
+        if (sh_dim > 3 && render_mod >= 1) {
+            float x = dir.x, y = dir.y, z = dir.z;
+            color += -SH_C1 * y * get_vec3(sh_start + 3)
+                   +  SH_C1 * z * get_vec3(sh_start + 6)
+                   -  SH_C1 * x * get_vec3(sh_start + 9);
 
-        if (sh_dim > 12) {
-            float xx = x*x, yy = y*y, zz = z*z;
-            float xy = x*y, yz = y*z, xz = x*z;
-            color +=
-                SH_C2_0 * xy          * get_vec3(sh_start + 12) +
-                SH_C2_1 * yz          * get_vec3(sh_start + 15) +
-                SH_C2_2 * (2*zz-xx-yy)* get_vec3(sh_start + 18) +
-                SH_C2_3 * xz          * get_vec3(sh_start + 21) +
-                SH_C2_4 * (xx-yy)     * get_vec3(sh_start + 24);
-
-            if (sh_dim > 27) {
+            if (sh_dim > 12 && render_mod >= 2) {
+                float xx = x*x, yy = y*y, zz = z*z;
+                float xy = x*y, yz = y*z, xz = x*z;
                 color +=
-                    SH_C3_0 * y * (3*xx - yy)      * get_vec3(sh_start + 27) +
-                    SH_C3_1 * xy * z                * get_vec3(sh_start + 30) +
-                    SH_C3_2 * y * (4*zz - xx - yy) * get_vec3(sh_start + 33) +
-                    SH_C3_3 * z * (2*zz - 3*xx - 3*yy) * get_vec3(sh_start + 36) +
-                    SH_C3_4 * x * (4*zz - xx - yy) * get_vec3(sh_start + 39) +
-                    SH_C3_5 * z * (xx - yy)         * get_vec3(sh_start + 42) +
-                    SH_C3_6 * x * (xx - 3*yy)       * get_vec3(sh_start + 45);
+                    SH_C2_0 * xy          * get_vec3(sh_start + 12) +
+                    SH_C2_1 * yz          * get_vec3(sh_start + 15) +
+                    SH_C2_2 * (2*zz-xx-yy)* get_vec3(sh_start + 18) +
+                    SH_C2_3 * xz          * get_vec3(sh_start + 21) +
+                    SH_C2_4 * (xx-yy)     * get_vec3(sh_start + 24);
+
+                if (sh_dim > 27 && render_mod >= 3) {
+                    color +=
+                        SH_C3_0 * y * (3*xx - yy)      * get_vec3(sh_start + 27) +
+                        SH_C3_1 * xy * z                * get_vec3(sh_start + 30) +
+                        SH_C3_2 * y * (4*zz - xx - yy) * get_vec3(sh_start + 33) +
+                        SH_C3_3 * z * (2*zz - 3*xx - 3*yy) * get_vec3(sh_start + 36) +
+                        SH_C3_4 * x * (4*zz - xx - yy) * get_vec3(sh_start + 39) +
+                        SH_C3_5 * z * (xx - yy)         * get_vec3(sh_start + 42) +
+                        SH_C3_6 * x * (xx - 3*yy)       * get_vec3(sh_start + 45);
+                }
             }
         }
+        color += 0.5f;
     }
-    color += 0.5f;
 
     // ── Emit billboard quad ───────────────────────────────────────────
     vec2 corners_ndc[4] = vec2[4](
@@ -237,10 +245,17 @@ in float frag_alpha;
 in vec3  frag_conic;
 in vec2  frag_coordxy;
 
+uniform int render_mod;
+
 out vec4 FragColor;
 
 void main()
 {
+    if (render_mod == -2) {
+        FragColor = vec4(frag_color, 1.f);
+        return;
+    }
+
     float power = -0.5f * (frag_conic.x * frag_coordxy.x * frag_coordxy.x
                          + frag_conic.z * frag_coordxy.y * frag_coordxy.y)
                 - frag_conic.y * frag_coordxy.x * frag_coordxy.y;
@@ -253,6 +268,13 @@ void main()
         discard;
 
     FragColor = vec4(frag_color, opacity);
+
+    if (render_mod == -3) {
+        FragColor.a = (FragColor.a > 0.22f) ? 1.f : 0.f;
+    } else if (render_mod == -4) {
+        FragColor.a   = (FragColor.a > 0.22f) ? 1.f : 0.f;
+        FragColor.rgb = FragColor.rgb * exp(power);
+    }
 }
 """
 
@@ -270,6 +292,7 @@ class VTKNativeGaussianRenderer:
         self._gaussians: util_gau.GaussianData | None = None
 
         self._scale_modifier = 1.0
+        self._render_mod = 3
         self._sh_dim = 3
 
         self._data_ssbo: int | None = None
@@ -337,6 +360,10 @@ class VTKNativeGaussianRenderer:
     def set_scale_modifier(self, modifier: float):
         """Set the scale modifier for all splats."""
         self._scale_modifier = float(modifier)
+
+    def set_render_mod(self, mod: int):
+        """Set the render mode (-4..3, maps from UI index via index-4)."""
+        self._render_mod = int(mod)
 
     def trigger_sort(self):
         """Mark that splats need re-sorting on the next render."""
@@ -415,6 +442,7 @@ class VTKNativeGaussianRenderer:
         self._set_v3(pid, "hfovxy_focal", np.array([htanx, htany, focal_len], np.float32))
         self._set_1f(pid, "scale_modifier", self._scale_modifier)
         self._set_1i(pid, "sh_dim", self._sh_dim)
+        self._set_1i(pid, "render_mod", self._render_mod)
 
         # Set up correct blend state and depth testing for the opaque pass
         ostate = self._vtk_renderer.GetRenderWindow().GetState()
