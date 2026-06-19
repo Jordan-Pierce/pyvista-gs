@@ -12,7 +12,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QEvent
 from PyQt5.QtGui import QFont, QSurfaceFormat, QPalette, QColor
 
 from . import data as util_gau
-from .actor import GaussianActor, VTKCameraAdapter
+from .actor import GaussianActor
 from .ui.control_panel import ControlPanel
 
 
