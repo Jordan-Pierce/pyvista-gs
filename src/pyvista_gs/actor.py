@@ -3,10 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pyvista as pv
 import vtk
-import OpenGL.GL as gl
-
 from . import data as util_gau
-from .renderer import OpenGLRenderer
+from .renderer import ModernGLRenderer
 
 
 def _rotation_matrix_to_wxyz(rotation_matrix: np.ndarray) -> np.ndarray:
@@ -137,7 +135,7 @@ class GaussianActor:
     """A PyVista actor that proxies the Gaussian splatting renderer."""
 
     def __init__(self, gaussian_data: util_gau.GaussianData):
-        self.renderer: OpenGLRenderer | None = None
+        self.renderer: ModernGLRenderer | None = None
         self._sync_needed = True
         self._last_mtime = 0
 
@@ -342,6 +340,32 @@ class GaussianActor:
     def point_count(self) -> int:
         return self._mesh.n_points if self._mesh else 0
 
+    # Expose common PyVista actor properties so users can manipulate the
+    # GaussianActor the same way they would a standard PyVista actor.
+    @property
+    def position(self):
+        return self.actor.position
+
+    @position.setter
+    def position(self, pos: tuple[float, float, float]):
+        self.actor.position = pos
+        try:
+            self.actor.Modified()
+        except Exception:
+            pass
+
+    @property
+    def scale(self):
+        return self.actor.scale
+
+    @scale.setter
+    def scale(self, scale_factor: tuple[float, float, float]):
+        self.actor.scale = scale_factor
+        try:
+            self.actor.Modified()
+        except Exception:
+            pass
+
     def bind_to_plotter(self, plotter: pv.Plotter):
         plotter.add_actor(self.actor, pickable=True)
         plotter.renderer.AddObserver(vtk.vtkCommand.EndEvent, self._on_render_end)
@@ -372,16 +396,29 @@ class GaussianActor:
     def pick_gaussian(self, ray_origin: np.ndarray, ray_dir: np.ndarray, fovy_rad: float, window_height: int) -> np.ndarray | None:
         if self.point_count == 0:
             return None
-
         xyz = np.array(self._mesh.points)
-        vecs = xyz - ray_origin
+
+        # If the PyVista actor has a transform (position/scale/orientation),
+        # apply it so picking is performed in world space.
+        try:
+            vtk_mat = self.actor.GetMatrix()
+            model_mat = np.zeros((4, 4), dtype=np.float64)
+            for i in range(4):
+                for j in range(4):
+                    model_mat[i, j] = vtk_mat.GetElement(i, j)
+            xyz_h = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float64)], axis=1)
+            world_xyz = (model_mat @ xyz_h.T).T[:, :3]
+        except Exception:
+            world_xyz = xyz
+
+        vecs = world_xyz - ray_origin
         t = np.sum(vecs * ray_dir, axis=1)
 
         front_mask = t > 0
         if not np.any(front_mask):
             return None
 
-        front_xyz = xyz[front_mask]
+        front_xyz = world_xyz[front_mask]
         front_vecs = front_xyz - ray_origin
         front_t = t[front_mask]
 
@@ -430,7 +467,7 @@ class GaussianActor:
             return
 
         if self.renderer is None:
-            self.renderer = OpenGLRenderer(w, h)
+            self.renderer = ModernGLRenderer(w, h)
             self._sync_to_renderer()
 
         self.renderer.set_crop_bounds(self._crop_bounds)
@@ -442,29 +479,29 @@ class GaussianActor:
         vtk_cam = caller.GetActiveCamera()
         cam_adapter = VTKCameraAdapter(vtk_cam, w, h)
 
+        # Extract the current spatial transform of the PyVista actor and pass
+        # it to the renderer so actor-level transforms are honored in the shader.
+        try:
+            vtk_matrix = self.actor.GetMatrix()
+            model_matrix = np.zeros((4, 4), dtype=np.float32)
+            for i in range(4):
+                for j in range(4):
+                    model_matrix[i, j] = vtk_matrix.GetElement(i, j)
+        except Exception:
+            model_matrix = np.eye(4, dtype=np.float32)
+
+        self.renderer.set_model_matrix(model_matrix)
+
         if self.auto_sort:
             self.sort_gaussians(cam_adapter)
 
-        last_prog = gl.glGetIntegerv(gl.GL_CURRENT_PROGRAM)
-        last_vao = gl.glGetIntegerv(gl.GL_VERTEX_ARRAY_BINDING)
-        last_blend = gl.glGetBoolean(gl.GL_BLEND)
-        last_depth_mask = gl.glGetBoolean(gl.GL_DEPTH_WRITEMASK)
-
-        gl.glEnable(gl.GL_BLEND)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-        gl.glDepthMask(gl.GL_FALSE)
+        self.renderer.ctx.enable(self.renderer.ctx.BLEND)
+        self.renderer.ctx.blend_func = (self.renderer.ctx.SRC_ALPHA, self.renderer.ctx.ONE_MINUS_SRC_ALPHA)
+        self.renderer.ctx.depth_mask = False
 
         self.renderer.update_camera_pose(cam_adapter)
         self.renderer.update_camera_intrin(cam_adapter)
         self.renderer.draw()
 
-        if last_depth_mask:
-            gl.glDepthMask(gl.GL_TRUE)
-        else:
-            gl.glDepthMask(gl.GL_FALSE)
-
-        if not last_blend:
-            gl.glDisable(gl.GL_BLEND)
-
-        gl.glUseProgram(last_prog)
-        gl.glBindVertexArray(last_vao)
+        self.renderer.ctx.depth_mask = True
+        self.renderer.ctx.disable(self.renderer.ctx.BLEND)

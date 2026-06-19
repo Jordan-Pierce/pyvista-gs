@@ -46,6 +46,7 @@ layout (std430, binding=1) buffer gaussian_order {
 
 uniform mat4 view_matrix;
 uniform mat4 projection_matrix;
+uniform mat4 model_matrix;
 uniform vec3 hfovxy_focal;
 uniform vec3 cam_pos;
 uniform int sh_dim;
@@ -121,7 +122,10 @@ void main()
 	int total_dim = 3 + 4 + 3 + 1 + sh_dim;
 	int start = boxid * total_dim;
 	vec4 g_pos = vec4(get_vec3(start + POS_IDX), 1.f);
-	if (crop_enabled == 1 && (any(lessThan(g_pos.xyz, crop_min)) || any(greaterThan(g_pos.xyz, crop_max))))
+	// Transform the Gaussian position by the actor's model matrix so
+	// actor-level translation/rotation/scale are honored.
+	vec4 g_pos_world = model_matrix * g_pos;
+	if (crop_enabled == 1 && (any(lessThan(g_pos_world.xyz, crop_min)) || any(greaterThan(g_pos_world.xyz, crop_max))))
 	{
 		color = vec3(0.f);
 		alpha = 0.f;
@@ -130,8 +134,8 @@ void main()
 		gl_Position = vec4(-100, -100, -100, 1);
 		return;
 	}
-    vec4 g_pos_view = view_matrix * g_pos;
-    vec4 g_pos_screen = projection_matrix * g_pos_view;
+	vec4 g_pos_view = view_matrix * g_pos_world;
+	vec4 g_pos_screen = projection_matrix * g_pos_view;
 	g_pos_screen.xyz = g_pos_screen.xyz / g_pos_screen.w;
     g_pos_screen.w = 1.f;
 	if (any(greaterThan(abs(g_pos_screen.xyz), vec3(1.3))))
@@ -143,7 +147,11 @@ void main()
 	vec3 g_scale = get_vec3(start + SCALE_IDX);
 	float g_opacity = g_data[start + OPACITY_IDX];
 
-    mat3 cov3d = computeCov3D(g_scale * scale_modifier, g_rot);
+	// Compute the local 3D covariance, then transform it by the actor's
+	// linear model matrix so non-uniform actor transforms are respected.
+	mat3 cov3d = computeCov3D(g_scale * scale_modifier, g_rot);
+	mat3 model3 = mat3(model_matrix);
+	cov3d = transpose(model3) * cov3d * model3;
     vec2 wh = 2 * hfovxy_focal.xy * hfovxy_focal.z;
     vec3 cov2d = computeCov2D(g_pos_view,
                               hfovxy_focal.z,
@@ -178,8 +186,9 @@ void main()
 	}
 
 	int sh_start = start + SH_IDX;
-	vec3 dir = g_pos.xyz - cam_pos;
-    dir = normalize(dir);
+	// Use world-space position for view-dependent shading computations.
+	vec3 dir = g_pos_world.xyz - cam_pos;
+	dir = normalize(dir);
 	color = SH_C0 * get_vec3(sh_start);
 
 	if (sh_dim > 3 && render_mod >= 1)
