@@ -3,8 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pyvista as pv
 import vtk
+
 from . import data as util_gau
-from .renderer import ModernGLRenderer
+from .renderer import ModernGLRenderer, _sort_gaussian
+from .vtk_proxy import VTKProxyActor
 
 
 def _rotation_matrix_to_wxyz(rotation_matrix: np.ndarray) -> np.ndarray:
@@ -132,7 +134,7 @@ class VTKCameraAdapter:
 
 
 class GaussianActor:
-    """A PyVista actor that proxies the Gaussian splatting renderer."""
+    """Hybrid actor: invisible VTK proxy for scene participation + ModernGL for visuals."""
 
     def __init__(self, gaussian_data: util_gau.GaussianData):
         self.renderer: ModernGLRenderer | None = None
@@ -156,16 +158,17 @@ class GaussianActor:
 
         self._original_mesh = self._mesh.copy()
 
-        self.mapper = pv.DataSetMapper(self._mesh)
-        self.actor = pv.Actor(mapper=self.mapper)
-        self.actor.prop.opacity = 0.0
-        self.actor.prop.point_size = 5.0
+        self._proxy = VTKProxyActor()
+        self._proxy.update_data(gaussian_data)
+
+        self.actor = self._proxy.actor
 
     def cleanup(self):
-        """Release the OpenGL renderer resources."""
+        """Release both ModernGL and VTK proxy resources."""
         if self.renderer:
             self.renderer.cleanup()
             self.renderer = None
+        self._proxy.cleanup()
 
     def set_crop_bounds(self, bounds: np.ndarray):
         """Enable a shader-side crop preview without mutating the mesh."""
@@ -183,10 +186,6 @@ class GaussianActor:
     def transform(self, matrix: np.ndarray):
         """
         Apply a 4x4 homogeneous transform to the splat positions, rotations, and scales.
-
-        PyVista updates point positions, but 3DGS also stores per-point quaternion and
-        scale data. We keep those attributes in sync so the actor remains mathematically
-        consistent after being moved, rotated, or non-uniformly scaled by callers.
         """
         matrix = np.asarray(matrix, dtype=np.float64)
         if matrix.shape != (4, 4):
@@ -220,9 +219,6 @@ class GaussianActor:
     def remove_floaters(self, min_opacity: float = 0.05, max_scale: float = 1.0):
         """
         Cull noisy splats that are too transparent or too large.
-
-        The selection is applied to both the live mesh and the original backup mesh so
-        cropping and reset operations continue to see the same cleaned dataset.
         """
         if self.point_count == 0:
             return
@@ -251,9 +247,6 @@ class GaussianActor:
     def tint_gaussians(self, indices: np.ndarray, color_rgb: tuple[int, int, int], blend_factor: float = 0.6):
         """
         Tint selected splats by modifying the DC spherical harmonic coefficients.
-
-        `indices` may be an integer index array or a boolean mask. Only the first three
-        SH coefficients are modified so the view-dependent bands remain untouched.
         """
         if self.point_count == 0:
             return
@@ -293,8 +286,6 @@ class GaussianActor:
     def apply_crop_box(self, bounds: np.ndarray | None = None):
         """
         Commit the current crop preview by deleting points outside the crop bounds.
-
-        If bounds are provided they become the active preview bounds before the commit.
         """
         if bounds is not None:
             self.set_crop_bounds(bounds)
@@ -333,41 +324,32 @@ class GaussianActor:
     @mesh.setter
     def mesh(self, new_mesh: pv.PolyData):
         self._mesh = new_mesh
-        self.mapper.dataset = self._mesh
         self._sync_needed = True
 
     @property
     def point_count(self) -> int:
         return self._mesh.n_points if self._mesh else 0
 
-    # Expose common PyVista actor properties so users can manipulate the
-    # GaussianActor the same way they would a standard PyVista actor.
     @property
     def position(self):
-        return self.actor.position
+        return self.actor.GetPosition()
 
     @position.setter
     def position(self, pos: tuple[float, float, float]):
-        self.actor.position = pos
-        try:
-            self.actor.Modified()
-        except Exception:
-            pass
+        self.actor.SetPosition(*pos)
+        self.actor.Modified()
 
     @property
     def scale(self):
-        return self.actor.scale
+        return self.actor.GetScale()
 
     @scale.setter
     def scale(self, scale_factor: tuple[float, float, float]):
-        self.actor.scale = scale_factor
-        try:
-            self.actor.Modified()
-        except Exception:
-            pass
+        self.actor.SetScale(*scale_factor)
+        self.actor.Modified()
 
     def bind_to_plotter(self, plotter: pv.Plotter):
-        plotter.add_actor(self.actor, pickable=True)
+        self._proxy.attach_to_renderer(plotter.renderer)
         plotter.renderer.AddObserver(vtk.vtkCommand.EndEvent, self._on_render_end)
 
     def _sync_to_renderer(self):
@@ -389,6 +371,8 @@ class GaussianActor:
         if self.renderer:
             self.renderer.update_gaussian_data(rebuilt_gaussians)
 
+        self._proxy.update_data(rebuilt_gaussians)
+
         self._last_mtime = self._mesh.GetMTime()
         self._sync_needed = False
         self._last_view_matrix = None
@@ -398,8 +382,6 @@ class GaussianActor:
             return None
         xyz = np.array(self._mesh.points)
 
-        # If the PyVista actor has a transform (position/scale/orientation),
-        # apply it so picking is performed in world space.
         try:
             vtk_mat = self.actor.GetMatrix()
             model_mat = np.zeros((4, 4), dtype=np.float64)
@@ -446,7 +428,13 @@ class GaussianActor:
             if np.allclose(view_mat, self._last_view_matrix, atol=self._sort_tolerance):
                 return
 
-        self.renderer.sort_and_update(cam_adapter)
+        if self.renderer.gaussians is not None:
+            index = _sort_gaussian(self.renderer.gaussians, view_mat)
+            sort_indices = index.flatten().astype(np.int32)
+
+            self.renderer.sort_and_update(cam_adapter)
+            self._proxy.update_sort_indices(sort_indices)
+
         self._last_view_matrix = view_mat.copy()
 
     def _on_render_end(self, caller, _event):
@@ -454,7 +442,6 @@ class GaussianActor:
         if self.point_count == 0:
             return
 
-        # Honor the VTK actor visibility flag so external code can hide/show splats
         if not self.actor.GetVisibility():
             return
 
@@ -476,11 +463,11 @@ class GaussianActor:
         self.renderer.reduce_updates = self.reduce_updates
         self.renderer.set_render_reso(w, h)
 
+        self._proxy.set_scale_modifier(self.scale_modifier)
+
         vtk_cam = caller.GetActiveCamera()
         cam_adapter = VTKCameraAdapter(vtk_cam, w, h)
 
-        # Extract the current spatial transform of the PyVista actor and pass
-        # it to the renderer so actor-level transforms are honored in the shader.
         try:
             vtk_matrix = self.actor.GetMatrix()
             model_matrix = np.zeros((4, 4), dtype=np.float32)
