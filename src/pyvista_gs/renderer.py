@@ -4,7 +4,7 @@ import importlib.util
 import os
 
 import numpy as np
-from OpenGL import GL as gl
+import moderngl
 
 from . import data as util_gau
 from . import utils as util
@@ -134,12 +134,20 @@ class GaussianRenderBase:
         raise NotImplementedError()
 
 
-class OpenGLRenderer(GaussianRenderBase):
+class ModernGLRenderer(GaussianRenderBase):
     def __init__(self, w, h):
         super().__init__()
-        gl.glViewport(0, 0, w, h)
-        self.program = util.load_shaders(VS_PATH, FS_PATH)
+        self.ctx = moderngl.create_context(require=430)
+        self.ctx.viewport = (0, 0, w, h)
+
         self._crop_bounds: np.ndarray | None = None
+
+        with open(VS_PATH, 'r', encoding='utf-8') as f:
+            vs_source = f.read()
+        with open(FS_PATH, 'r', encoding='utf-8') as f:
+            fs_source = f.read()
+
+        self.program = self.ctx.program(vertex_shader=vs_source, fragment_shader=fs_source)
 
         self.quad_v = np.array([
             -1, 1,
@@ -150,17 +158,14 @@ class OpenGLRenderer(GaussianRenderBase):
         self.quad_f = np.array([
             0, 1, 2,
             0, 2, 3,
-        ], dtype=np.uint32).reshape(2, 3)
+        ], dtype=np.int32).reshape(2, 3)
 
-        vao, _ = util.set_attributes(self.program, ["position"], [self.quad_v])
-        util.set_faces_tovao(vao, self.quad_f)
-        self.vao = vao
-        self.gau_bufferid = None
-        self.index_bufferid = None
+        self.vbo = self.ctx.buffer(self.quad_v.tobytes())
+        self.ibo = self.ctx.buffer(self.quad_f.tobytes())
+        self.vao = self.ctx.vertex_array(self.program, [(self.vbo, '2f', 'position')], self.ibo)
 
-        gl.glDisable(gl.GL_CULL_FACE)
-        gl.glEnable(gl.GL_BLEND)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        self.gau_buffer = None
+        self.index_buffer = None
 
         self.update_vsync()
 
@@ -174,7 +179,6 @@ class OpenGLRenderer(GaussianRenderBase):
         if bounds is None:
             self._crop_bounds = None
             return
-
         crop_bounds = np.asarray(bounds, dtype=np.float32).ravel()
         if crop_bounds.size != 6:
             raise ValueError("Crop bounds must contain 6 values: xmin, xmax, ymin, ymax, zmin, zmax")
@@ -185,80 +189,96 @@ class OpenGLRenderer(GaussianRenderBase):
 
     def _upload_crop_uniforms(self):
         enabled = 1 if self._crop_bounds is not None else 0
-        util.set_uniform_1int(self.program, enabled, "crop_enabled")
+        if 'crop_enabled' in self.program:
+            self.program['crop_enabled'].value = enabled
         if self._crop_bounds is not None:
-            crop_min = np.array([self._crop_bounds[0], self._crop_bounds[2], self._crop_bounds[4]], dtype=np.float32)
-            crop_max = np.array([self._crop_bounds[1], self._crop_bounds[3], self._crop_bounds[5]], dtype=np.float32)
-            util.set_uniform_v3(self.program, crop_min, "crop_min")
-            util.set_uniform_v3(self.program, crop_max, "crop_max")
+            if 'crop_min' in self.program:
+                self.program['crop_min'].value = tuple(self._crop_bounds[[0, 2, 4]])
+            if 'crop_max' in self.program:
+                self.program['crop_max'].value = tuple(self._crop_bounds[[1, 3, 5]])
 
     def update_gaussian_data(self, gaus: util_gau.GaussianData):
         self.gaussians = gaus
         gaussian_data = gaus.flat()
-        self.gau_bufferid = util.set_storage_buffer_data(
-            self.program,
-            "gaussian_data",
-            gaussian_data,
-            bind_idx=0,
-            buffer_id=self.gau_bufferid,
-        )
-        util.set_uniform_1int(self.program, gaus.sh_dim, "sh_dim")
+
+        if self.gau_buffer is None or self.gau_buffer.size < gaussian_data.nbytes:
+            if self.gau_buffer:
+                self.gau_buffer.release()
+            self.gau_buffer = self.ctx.buffer(gaussian_data.tobytes())
+        else:
+            self.gau_buffer.write(gaussian_data.tobytes())
+
+        self.gau_buffer.bind_to_storage_buffer(binding=0)
+
+        if 'sh_dim' in self.program:
+            self.program['sh_dim'].value = gaus.sh_dim
 
     def sort_and_update(self, camera: util.Camera):
         index = _sort_gaussian(self.gaussians, camera.get_view_matrix())
-        self.index_bufferid = util.set_storage_buffer_data(
-            self.program,
-            "gi",
-            index,
-            bind_idx=1,
-            buffer_id=self.index_bufferid,
-        )
-        return
+        if self.index_buffer is None or self.index_buffer.size < index.nbytes:
+            if self.index_buffer:
+                self.index_buffer.release()
+            self.index_buffer = self.ctx.buffer(index.tobytes())
+        else:
+            self.index_buffer.write(index.tobytes())
+
+        self.index_buffer.bind_to_storage_buffer(binding=1)
 
     def set_scale_modifier(self, modifier):
-        util.set_uniform_1f(self.program, modifier, "scale_modifier")
+        if 'scale_modifier' in self.program:
+            self.program['scale_modifier'].value = float(modifier)
 
     def set_render_mod(self, mod: int):
-        util.set_uniform_1int(self.program, mod, "render_mod")
+        if 'render_mod' in self.program:
+            self.program['render_mod'].value = int(mod)
 
     def set_render_reso(self, w, h):
-        gl.glViewport(0, 0, w, h)
+        self.ctx.viewport = (0, 0, w, h)
+
+    def set_model_matrix(self, matrix):
+        if matrix is None:
+            matrix = np.eye(4, dtype=np.float32)
+        if 'model_matrix' in self.program:
+            self.program['model_matrix'].write(matrix.astype('f4').T.tobytes())
 
     def update_camera_pose(self, camera: util.Camera):
         view_mat = camera.get_view_matrix()
-        util.set_uniform_mat4(self.program, view_mat, "view_matrix")
-        util.set_uniform_v3(self.program, camera.position, "cam_pos")
+        if 'view_matrix' in self.program:
+            self.program['view_matrix'].write(view_mat.astype('f4').T.tobytes())
+        if 'cam_pos' in self.program:
+            self.program['cam_pos'].value = tuple(camera.position)
 
     def update_camera_intrin(self, camera: util.Camera):
         proj_mat = camera.get_project_matrix()
-        util.set_uniform_mat4(self.program, proj_mat, "projection_matrix")
-        util.set_uniform_v3(self.program, camera.get_htanfovxy_focal(), "hfovxy_focal")
+        if 'projection_matrix' in self.program:
+            self.program['projection_matrix'].write(proj_mat.astype('f4').T.tobytes())
+        if 'hfovxy_focal' in self.program:
+            self.program['hfovxy_focal'].value = tuple(camera.get_htanfovxy_focal())
 
     def draw(self):
-        gl.glUseProgram(self.program)
         self._upload_crop_uniforms()
-        gl.glBindVertexArray(self.vao)
         num_gau = len(self.gaussians)
-        gl.glDrawElementsInstanced(gl.GL_TRIANGLES, len(self.quad_f.reshape(-1)), gl.GL_UNSIGNED_INT, None, num_gau)
+        self.vao.render(moderngl.TRIANGLES, instances=num_gau)
 
     def cleanup(self):
         try:
-            if self.program:
-                gl.glDeleteProgram(self.program)
-                self.program = None
+            if self.gau_buffer:
+                self.gau_buffer.release()
+                self.gau_buffer = None
+            if self.index_buffer:
+                self.index_buffer.release()
+                self.index_buffer = None
             if self.vao:
-                gl.glDeleteVertexArrays(1, [self.vao])
+                self.vao.release()
                 self.vao = None
-
-            buffers = []
-            if self.gau_bufferid:
-                buffers.append(self.gau_bufferid)
-            if self.index_bufferid:
-                buffers.append(self.index_bufferid)
-
-            if buffers:
-                gl.glDeleteBuffers(len(buffers), buffers)
-                self.gau_bufferid = None
-                self.index_bufferid = None
+            if self.vbo:
+                self.vbo.release()
+                self.vbo = None
+            if self.ibo:
+                self.ibo.release()
+                self.ibo = None
+            if self.program:
+                self.program.release()
+                self.program = None
         except Exception as e:
-            print(f"Warning: OpenGL cleanup failed: {e}")
+            print(f"Warning: ModernGL cleanup failed: {e}")

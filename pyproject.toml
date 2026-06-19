@@ -24,14 +24,16 @@ dependencies = [
 ]
 
 [project.scripts]
-pyvista-gs = "pyvista-gs.app:main"
+# The key is the terminal command (hyphen allowed)
+# The value is the Python import path (MUST use an underscore)
+pyvista-gs = "pyvista_gs.app:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["pyvista-gs*"]
+include = ["pyvista_gs*"]
 
 [tool.setuptools.package-data]
-"pyvista-gs.shaders" = ["*.glsl"]
+"pyvista_gs.shaders" = ["*.glsl"]

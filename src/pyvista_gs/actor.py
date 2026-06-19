@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pyvista as pv
 import vtk
-import OpenGL.GL as gl
 
 from . import data as util_gau
-from .renderer import OpenGLRenderer
+from .renderer import ModernGLRenderer, _sort_gaussian
+from .vtk_proxy import VTKProxyActor
 
 
 def _rotation_matrix_to_wxyz(rotation_matrix: np.ndarray) -> np.ndarray:
@@ -134,10 +134,10 @@ class VTKCameraAdapter:
 
 
 class GaussianActor:
-    """A PyVista actor that proxies the Gaussian splatting renderer."""
+    """Hybrid actor: invisible VTK proxy for scene participation + ModernGL for visuals."""
 
     def __init__(self, gaussian_data: util_gau.GaussianData):
-        self.renderer: OpenGLRenderer | None = None
+        self.renderer: ModernGLRenderer | None = None
         self._sync_needed = True
         self._last_mtime = 0
 
@@ -158,16 +158,17 @@ class GaussianActor:
 
         self._original_mesh = self._mesh.copy()
 
-        self.mapper = pv.DataSetMapper(self._mesh)
-        self.actor = pv.Actor(mapper=self.mapper)
-        self.actor.prop.opacity = 0.0
-        self.actor.prop.point_size = 5.0
+        self._proxy = VTKProxyActor()
+        self._proxy.update_data(gaussian_data)
+
+        self.actor = self._proxy.actor
 
     def cleanup(self):
-        """Release the OpenGL renderer resources."""
+        """Release both ModernGL and VTK proxy resources."""
         if self.renderer:
             self.renderer.cleanup()
             self.renderer = None
+        self._proxy.cleanup()
 
     def set_crop_bounds(self, bounds: np.ndarray):
         """Enable a shader-side crop preview without mutating the mesh."""
@@ -185,10 +186,6 @@ class GaussianActor:
     def transform(self, matrix: np.ndarray):
         """
         Apply a 4x4 homogeneous transform to the splat positions, rotations, and scales.
-
-        PyVista updates point positions, but 3DGS also stores per-point quaternion and
-        scale data. We keep those attributes in sync so the actor remains mathematically
-        consistent after being moved, rotated, or non-uniformly scaled by callers.
         """
         matrix = np.asarray(matrix, dtype=np.float64)
         if matrix.shape != (4, 4):
@@ -222,9 +219,6 @@ class GaussianActor:
     def remove_floaters(self, min_opacity: float = 0.05, max_scale: float = 1.0):
         """
         Cull noisy splats that are too transparent or too large.
-
-        The selection is applied to both the live mesh and the original backup mesh so
-        cropping and reset operations continue to see the same cleaned dataset.
         """
         if self.point_count == 0:
             return
@@ -253,9 +247,6 @@ class GaussianActor:
     def tint_gaussians(self, indices: np.ndarray, color_rgb: tuple[int, int, int], blend_factor: float = 0.6):
         """
         Tint selected splats by modifying the DC spherical harmonic coefficients.
-
-        `indices` may be an integer index array or a boolean mask. Only the first three
-        SH coefficients are modified so the view-dependent bands remain untouched.
         """
         if self.point_count == 0:
             return
@@ -295,8 +286,6 @@ class GaussianActor:
     def apply_crop_box(self, bounds: np.ndarray | None = None):
         """
         Commit the current crop preview by deleting points outside the crop bounds.
-
-        If bounds are provided they become the active preview bounds before the commit.
         """
         if bounds is not None:
             self.set_crop_bounds(bounds)
@@ -335,15 +324,32 @@ class GaussianActor:
     @mesh.setter
     def mesh(self, new_mesh: pv.PolyData):
         self._mesh = new_mesh
-        self.mapper.dataset = self._mesh
         self._sync_needed = True
 
     @property
     def point_count(self) -> int:
         return self._mesh.n_points if self._mesh else 0
 
+    @property
+    def position(self):
+        return self.actor.GetPosition()
+
+    @position.setter
+    def position(self, pos: tuple[float, float, float]):
+        self.actor.SetPosition(*pos)
+        self.actor.Modified()
+
+    @property
+    def scale(self):
+        return self.actor.GetScale()
+
+    @scale.setter
+    def scale(self, scale_factor: tuple[float, float, float]):
+        self.actor.SetScale(*scale_factor)
+        self.actor.Modified()
+
     def bind_to_plotter(self, plotter: pv.Plotter):
-        plotter.add_actor(self.actor, pickable=True)
+        self._proxy.attach_to_renderer(plotter.renderer)
         plotter.renderer.AddObserver(vtk.vtkCommand.EndEvent, self._on_render_end)
 
     def _sync_to_renderer(self):
@@ -365,6 +371,8 @@ class GaussianActor:
         if self.renderer:
             self.renderer.update_gaussian_data(rebuilt_gaussians)
 
+        self._proxy.update_data(rebuilt_gaussians)
+
         self._last_mtime = self._mesh.GetMTime()
         self._sync_needed = False
         self._last_view_matrix = None
@@ -372,16 +380,27 @@ class GaussianActor:
     def pick_gaussian(self, ray_origin: np.ndarray, ray_dir: np.ndarray, fovy_rad: float, window_height: int) -> np.ndarray | None:
         if self.point_count == 0:
             return None
-
         xyz = np.array(self._mesh.points)
-        vecs = xyz - ray_origin
+
+        try:
+            vtk_mat = self.actor.GetMatrix()
+            model_mat = np.zeros((4, 4), dtype=np.float64)
+            for i in range(4):
+                for j in range(4):
+                    model_mat[i, j] = vtk_mat.GetElement(i, j)
+            xyz_h = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float64)], axis=1)
+            world_xyz = (model_mat @ xyz_h.T).T[:, :3]
+        except Exception:
+            world_xyz = xyz
+
+        vecs = world_xyz - ray_origin
         t = np.sum(vecs * ray_dir, axis=1)
 
         front_mask = t > 0
         if not np.any(front_mask):
             return None
 
-        front_xyz = xyz[front_mask]
+        front_xyz = world_xyz[front_mask]
         front_vecs = front_xyz - ray_origin
         front_t = t[front_mask]
 
@@ -409,12 +428,21 @@ class GaussianActor:
             if np.allclose(view_mat, self._last_view_matrix, atol=self._sort_tolerance):
                 return
 
-        self.renderer.sort_and_update(cam_adapter)
+        if self.renderer.gaussians is not None:
+            index = _sort_gaussian(self.renderer.gaussians, view_mat)
+            sort_indices = index.flatten().astype(np.int32)
+
+            self.renderer.sort_and_update(cam_adapter)
+            self._proxy.update_sort_indices(sort_indices)
+
         self._last_view_matrix = view_mat.copy()
 
     def _on_render_end(self, caller, _event):
         del _event
         if self.point_count == 0:
+            return
+
+        if not self.actor.GetVisibility():
             return
 
         if self._sync_needed or self._mesh.GetMTime() > self._last_mtime:
@@ -426,7 +454,7 @@ class GaussianActor:
             return
 
         if self.renderer is None:
-            self.renderer = OpenGLRenderer(w, h)
+            self.renderer = ModernGLRenderer(w, h)
             self._sync_to_renderer()
 
         self.renderer.set_crop_bounds(self._crop_bounds)
@@ -435,32 +463,32 @@ class GaussianActor:
         self.renderer.reduce_updates = self.reduce_updates
         self.renderer.set_render_reso(w, h)
 
+        self._proxy.set_scale_modifier(self.scale_modifier)
+
         vtk_cam = caller.GetActiveCamera()
         cam_adapter = VTKCameraAdapter(vtk_cam, w, h)
+
+        try:
+            vtk_matrix = self.actor.GetMatrix()
+            model_matrix = np.zeros((4, 4), dtype=np.float32)
+            for i in range(4):
+                for j in range(4):
+                    model_matrix[i, j] = vtk_matrix.GetElement(i, j)
+        except Exception:
+            model_matrix = np.eye(4, dtype=np.float32)
+
+        self.renderer.set_model_matrix(model_matrix)
 
         if self.auto_sort:
             self.sort_gaussians(cam_adapter)
 
-        last_prog = gl.glGetIntegerv(gl.GL_CURRENT_PROGRAM)
-        last_vao = gl.glGetIntegerv(gl.GL_VERTEX_ARRAY_BINDING)
-        last_blend = gl.glGetBoolean(gl.GL_BLEND)
-        last_depth_mask = gl.glGetBoolean(gl.GL_DEPTH_WRITEMASK)
-
-        gl.glEnable(gl.GL_BLEND)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-        gl.glDepthMask(gl.GL_FALSE)
+        self.renderer.ctx.enable(self.renderer.ctx.BLEND)
+        self.renderer.ctx.blend_func = (self.renderer.ctx.SRC_ALPHA, self.renderer.ctx.ONE_MINUS_SRC_ALPHA)
+        self.renderer.ctx.depth_mask = False
 
         self.renderer.update_camera_pose(cam_adapter)
         self.renderer.update_camera_intrin(cam_adapter)
         self.renderer.draw()
 
-        if last_depth_mask:
-            gl.glDepthMask(gl.GL_TRUE)
-        else:
-            gl.glDepthMask(gl.GL_FALSE)
-
-        if not last_blend:
-            gl.glDisable(gl.GL_BLEND)
-
-        gl.glUseProgram(last_prog)
-        gl.glBindVertexArray(last_vao)
+        self.renderer.ctx.depth_mask = True
+        self.renderer.ctx.disable(self.renderer.ctx.BLEND)
