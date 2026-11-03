@@ -141,3 +141,6 @@ to the working vertex shader version.
 **Key Insight:** The issue was not precision, not matrix conventions, not data,
 and not the SH coefficients. It was **VTK's rendering pass selection**. Once
 that was fixed, the single-pass actor worked perfectly.
+
+Curious? Checkout branch `acrhive/shading-attmpt` and run `unified_viewer.py`.
+
