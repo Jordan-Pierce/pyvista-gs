@@ -6,6 +6,10 @@ imageio
 plyfile
 PyGLM
 
+# moderngl     # only for the legacy ModernGLRenderer (renderer.py)
+pyvistaqt
+pyvista
+
 # PyQt5 application layer
 PyQt5
 PyQt5-Qt5
@@ -14,7 +18,3 @@ PyQt5-sip
 # Optional — faster Gaussian sorting backends
 # cupy-cuda11x   # or cupy-cuda12x depending on your CUDA version
 # torch          # only needed for CUDA renderer
-
-# Optional — PyVista integration (future use)
-# pyvista
-# pyvistaqt

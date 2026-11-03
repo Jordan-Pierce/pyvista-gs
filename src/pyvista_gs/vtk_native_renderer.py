@@ -18,7 +18,7 @@ from vtkmodules.util.misc import calldata_type
 from vtkmodules.vtkCommonCore import VTK_OBJECT
 
 from . import data as util_gau
-from .renderer import _sort_gaussian
+from .sorting import _sort_gaussian
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 

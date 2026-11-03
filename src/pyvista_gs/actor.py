@@ -5,7 +5,6 @@ import pyvista as pv
 import vtk
 
 from . import data as util_gau
-from .renderer import _sort_gaussian
 from .vtk_native_renderer import VTKNativeGaussianRenderer
 
 # Number of randomly-sampled Gaussian centres used for fast hover picking.

@@ -1,13 +1,17 @@
+"""Legacy standalone ModernGL renderer (not used by GaussianActor).
+
+moderngl is imported lazily inside ModernGLRenderer so importing this module
+(or the package) does not require moderngl to be installed.
+"""
 from __future__ import annotations
 
-import importlib.util
 import os
 
 import numpy as np
-import moderngl
 
 from . import data as util_gau
 from . import utils as util
+from .sorting import _sort_gaussian  # noqa: F401  (re-exported for back-compat)
 
 try:
     from OpenGL.raw.WGL.EXT.swap_control import wglSwapIntervalEXT
@@ -18,72 +22,6 @@ except Exception:
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 VS_PATH = os.path.join(MODULE_DIR, 'shaders', 'gau_vert.glsl')
 FS_PATH = os.path.join(MODULE_DIR, 'shaders', 'gau_frag.glsl')
-
-_sort_buffer_xyz = None
-_sort_buffer_gausid = None
-
-
-def _sort_gaussian_cpu(gaus, view_mat):
-    xyz = np.asarray(gaus.xyz)
-    view_mat = np.asarray(view_mat)
-
-    xyz_view = view_mat[None, :3, :3] @ xyz[..., None] + view_mat[None, :3, 3, None]
-    depth = xyz_view[:, 2, 0]
-
-    index = np.argsort(depth)
-    index = index.astype(np.int32).reshape(-1, 1)
-    return index
-
-
-def _sort_gaussian_cupy(gaus, view_mat):
-    import cupy as cp  # type: ignore[reportMissingImports]
-
-    global _sort_buffer_gausid, _sort_buffer_xyz
-    if _sort_buffer_gausid != id(gaus):
-        _sort_buffer_xyz = cp.asarray(gaus.xyz)
-        _sort_buffer_gausid = id(gaus)
-
-    xyz = _sort_buffer_xyz
-    view_mat = cp.asarray(view_mat)
-
-    xyz_view = view_mat[None, :3, :3] @ xyz[..., None] + view_mat[None, :3, 3, None]
-    depth = xyz_view[:, 2, 0]
-
-    index = cp.argsort(depth)
-    index = index.astype(cp.int32).reshape(-1, 1)
-
-    index = cp.asnumpy(index)
-    return index
-
-
-def _sort_gaussian_torch(gaus, view_mat):
-    global _sort_buffer_gausid, _sort_buffer_xyz
-    if _sort_buffer_gausid != id(gaus):
-        _sort_buffer_xyz = torch.tensor(gaus.xyz).cuda()
-        _sort_buffer_gausid = id(gaus)
-
-    xyz = _sort_buffer_xyz
-    view_mat = torch.tensor(view_mat).cuda()
-    xyz_view = view_mat[None, :3, :3] @ xyz[..., None] + view_mat[None, :3, 3, None]
-    depth = xyz_view[:, 2, 0]
-    index = torch.argsort(depth)
-    index = index.type(torch.int32).reshape(-1, 1).cpu().numpy()
-    return index
-
-
-_sort_gaussian = None
-try:
-    import torch  # type: ignore[reportMissingImports]
-    if not torch.cuda.is_available():
-        raise ImportError
-    print("Detect torch cuda installed, will use torch as sorting backend")
-    _sort_gaussian = _sort_gaussian_torch
-except ImportError:
-    if importlib.util.find_spec("cupy") is not None:
-        print("Detect cupy installed, will use cupy as sorting backend")
-        _sort_gaussian = _sort_gaussian_cupy
-    else:
-        _sort_gaussian = _sort_gaussian_cpu
 
 
 class GaussianRenderBase:
@@ -137,6 +75,9 @@ class GaussianRenderBase:
 class ModernGLRenderer(GaussianRenderBase):
     def __init__(self, w, h):
         super().__init__()
+        import moderngl  # optional dependency; only needed for this renderer
+
+        self._mgl = moderngl
         self.ctx = moderngl.create_context(require=430)
         self.ctx.viewport = (0, 0, w, h)
 
@@ -258,7 +199,7 @@ class ModernGLRenderer(GaussianRenderBase):
     def draw(self):
         self._upload_crop_uniforms()
         num_gau = len(self.gaussians)
-        self.vao.render(moderngl.TRIANGLES, instances=num_gau)
+        self.vao.render(self._mgl.TRIANGLES, instances=num_gau)
 
     def cleanup(self):
         try:

@@ -65,7 +65,7 @@ pip install -e .
 ```bash
 pyvista-gs
 python -m pyvista_gs
-python -m pyvista_gs --hidpi    # 1.5x font scale on HiDPI displays
+python -m pyvista_gs --hidpi    # larger UI font (14 pt) on HiDPI displays
 ```
 
 ## Usage
@@ -74,38 +74,50 @@ Use `GaussianActor` to add 3D Gaussian splats to an existing PyVista
 application:
 
 ```python
+import pyvista as pv
 from pyvista_gs import GaussianActor, load_ply
 
+plotter = pv.Plotter()
 gaussians = load_ply("/path/to/point_cloud.ply")
 actor = GaussianActor(gaussians)
-actor.bind_to_plotter(plotter)
+actor.bind_to_plotter(plotter)  # adds the splat actor to plotter.renderer
+plotter.show()
 ```
+
+`bind_to_plotter()` creates the GPU renderer and adds the `vtkActor` to the
+scene, so don't call `plotter.add_actor()` yourself. The raw VTK actor is
+available as `actor.actor` once bound. You need an OpenGL 4.3+ context because
+the renderer uses geometry shaders and SSBOs.
 
 ### Features
 
-- **Crop preview** — `set_crop_bounds(...)` applies a shader-side crop without
-  mutating the data. Call `apply_crop_box()` to permanently remove splats
-  outside the box.
+- **Crop** — `set_crop_bounds(bounds)` stores `(xmin, xmax, ymin, ymax, zmin,
+  zmax)` bounds. `apply_crop_box()` permanently removes splats outside them, and
+  `clear_crop_box()` discards them. Rendering isn't clipped until you apply.
 - **Transform** — `transform(matrix)` applies a 4×4 homogeneous transform to
   positions, rotations, and scales.
 - **Floater removal** — `remove_floaters(min_opacity, max_scale)` culls noisy
   splats that are too transparent or too large.
-- **Tinting** — `tint_gaussians(indices, color_rgb)` modifies the DC spherical
-  harmonic coefficients to recolor selected splats.
-- **Picking** — `pick_gaussian(ray_origin, ray_dir, ...)` performs CPU
-  ray-casting against Gaussian centres.
+- **Tinting** — `tint_gaussians(indices, color_rgb, blend_factor=0.6)` blends
+  a 0–255 RGB color into the DC spherical harmonic coefficients of the selected
+  splats. `reset_colors()` restores the original colors.
+- **Picking** — `pick_gaussian(ray_origin, ray_dir, fovy_rad, window_height)`
+  estimates on the CPU the world-space surface point under a view ray, using
+  an opacity-weighted depth of nearby Gaussian centres. It returns a point on
+  the ray, not a splat index.
 
 ### Embedding
 
-If you want the full standalone window, import `MainWindow`. If you want the
-reusable Qt sidebar in your own app, import `ControlPanel`.
+For the full standalone window, use `from pyvista_gs import MainWindow`. For the
+Qt sidebar, use `from pyvista_gs.ui import ControlPanel`. It expects a
+`MainWindow`-like object as its first argument.
 
 ### GPU sorting
 
 Optional CUDA sorting backends (`torch` or `cupy`) are detected at runtime and
 used automatically when installed. Falls back to NumPy CPU sorting otherwise.
 
-## Technical Deep Dive: Solving "Blown-Out SH" in VTK's Geometry Shader
+## The Crux: Solving "Blown-Out SH" in VTK's Geometry Shader
 
 The original architecture was a hybrid VTK + ModernGL workaround due to
 SH color evaluation producing blown-out results in VTK's geometry shader. After
