@@ -40,7 +40,7 @@ import glm
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from pyvista_gs.data import GaussianData, load_ply  # noqa: E402
-from pyvista_gs.renderer import _sort_gaussian       # noqa: E402
+from pyvista_gs.sorting import _sort_gaussian        # noqa: E402
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Inline VTK shaders — the geometry shader contains the broken SH evaluation
